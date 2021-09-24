@@ -1,0 +1,2827 @@
+---
+title: "Streaming Data Management and Time Series Analysis"
+author: "Lucia Ravazzi"
+date: "14/12/2020"
+output:
+  prettydoc::html_pretty:
+    theme: tactile
+    highlight: github
+    toc: true
+editor_options: 
+  chunk_output_type: inline
+---
+
+## IMPORT DATA
+
+```{r include = FALSE}
+
+rm(list=ls())
+
+#-- IMPORT DATASET.
+library(prettydoc)
+library(xts)
+library(forecast)
+library(ggplot2)
+library(dplyr)
+library(KFAS)
+library(ggpubr)
+library(feasts)
+library(fpp3)
+library(tidyverse)
+library(DataCombine)
+library(TSA)
+library(fastDummies)
+library(autoplotly)
+
+source("my_functions.R")
+
+# Il 1 Settembre 2018 è un sabato.
+df = read.csv('Dataset/TrainingSet.csv', sep = ';')
+
+df %>% dim()
+str(df)
+
+```
+
+
+```{r echo = FALSE}
+df %>% head()
+```
+
+```{r echo = FALSE}
+df %>% tail()
+```
+
+## PREPROCESSING
+
+Dopo avr importanto i dati, è arrivato il momento di processarli in modo da avere un formato migliore per i modelli che saranno sviluppati.
+
+```{r include = FALSE}
+str(df)
+df$VALORE = as.numeric(df$VALORE)
+```
+
+
+Prima di tutto, si nota che non vi sono valori mancanti. 
+
+```{r echo = FALSE}
+# Non ci sono valori nulli.
+df %>% is.na() %>% colSums()
+```
+
+Poiché i dati sono stati raccolti per due anni consecutivi, a causa del cambio dell'ora ci sono dei giorni che potrebbero avere un numero di ore diverse da 24. Infatti, si osserva tale fenomeno nele date riportate nella tabella sottostante.  
+
+```{r echo = FALSE}
+
+# Controllo se tutti i giorni hanno la stessa lunghezza (24 ore)
+
+check = df %>% dplyr::group_by(DATA) %>% summarise(count = n_distinct(Ora))
+check = check %>% `colnames<-`(c('DATA', 'Numero_Ore_Distinte'))
+check[check$Numero_Ore_Distinte != 24,]
+
+rm(check)
+
+```
+
+In particolare, è proprio la terza ora di quei giorni che risulta mancare. 
+
+```{r include = FALSE}
+df[df$DATA == '2019-03-31',]
+df[df$DATA == '2020-03-29',]
+```
+
+Per mantenere lo stesso formato di tutti gli altri giorni, ho assegnato a tali valori mancanti il valore precedente dello stesso giorno, i.e. il valore registrati all'ora 2:00. Questa è una scelta arbitraria e, dato che il numero di dati a disposizione è sufficientemente grande, non influirà sul reto del lavoro. Ci si potrebbe anche aspettare la presenza di giorni nel mese ottobre con 25 ore ma che non sono presenti in questo dataset. 
+
+```{r include = FALSE}
+
+# Assegno ai valori mancanti al valore 2 di notte (valore precedente). 
+
+df = InsertRow(df, c('2019-03-31', 3, df[df$DATA == '2019-03-31' & df$Ora == 2,]$VALORE), RowNum = 5067)
+df = InsertRow(df, c('2020-03-29', 3, df[df$DATA == '2020-03-29' & df$Ora == 2,]$VALORE), RowNum = 13802)
+
+```
+
+Inoltre, non ci sono duplicati nella serie storica. 
+
+```{r include = FALSE}
+df %>% distinct() %>% dim()
+```
+
+```{r}
+summary(as.numeric(df$VALORE))
+```
+
+
+
+## ESPLORAZIONE
+
+In questa sezione, vogliamo esplorare i dati univariati forniti per capire se vi sono delle stagionalità, trend, cicli e l'impatto delle festività.
+
+```{r include = FALSE}
+
+#-- Creo la serie temporale.
+
+# creo un altro  format per la data.
+
+df$FullHour = apply(df, 1, FUN = change)
+df$FullDate = paste(df$DATA, df$FullHour)
+
+Sys.setenv(TZ = "UTC")
+data <- xts(as.numeric(df$VALORE), as.POSIXct(df$FullDate, format = "%Y-%m-%d %H:%M:%S", tz = "UTC"))
+
+# combaciano. 
+data %>% nrow() == df %>% nrow()
+```
+
+Osservando tutta la serie storica nella sua interezza, si osserva che la serie sembra decrescere leggermente nel tempo.
+Inoltre, si nota una crescita significativa nella stagione estiva per entrambi gli anni, in particolare nei mesi di luglio e agosto, ed una crescita meno spiccata, ma comunque significativa, nei mesi di gennaio e febbraio. Dopo queste crescite si osserva sempre una decrescita più o meno liscia.
+
+```{r include = FALSE}
+autoplot(data) + xlab('Time') + ylab('Value')
+```
+
+
+Alcune stagionalità possono essere intuite analizzando il grafico di cui sopra ma, per ottenere delle considerazioni quantitative, la trasformata di fourier potrebbe aiutare. 
+Dato un segnale armonico, è possibile suddividere tale segnale nella somma pesata delle diverse armoniche fondamentali, i.e. serie di fourier. La serie storica d'interesse non è sicuramente un segnale armonico puro ma alcune frequenze possono comunque essere individuate, come riportato dal periodigramma, i.e. una stima della densità spettrale per le diverse frequenze individuate. 
+Di conseguenza, potremmo conoscere la distribuzione della potenza del segnale suddiviso nelle sue armoniche. 
+
+```{r echo = FALSE, fig.align="center", fig.width = 7,  fig.height = 3}
+
+PGram = periodogram(data, plot = FALSE)
+PGramAsDataFrame = data.frame(freq=PGram$freq, spec=PGram$spec)
+order = PGramAsDataFrame[order(-PGramAsDataFrame$spec),]
+top = head(order, 50)
+top$period = 1 / top$freq  
+top$Days = top$period / 24
+top$Month = top$period / (24*30)
+top$Week = top$period / (24*7)
+top$Year = top$period / (24*365)
+
+
+ggplot(top, aes(x = freq, y = spec)) + geom_point()  + 
+  geom_linerange(aes(x=freq, ymax=spec, ymin=0.75)) + 
+  labs(x = "Frequenza", y = "Densità spetrale")
+
+rm(top, PGram, PGramAsDataFrame, order)
+# riesce a riconoscere le frequenze più importanti: giornaliera,
+# di metà giornata, mensile, settimanale ed annuale. 
+```
+
+Nel periodigramma si osserva che vi sono cinque picchi principali. Analizziamoli più in dettaglio. In ordine decrescente di ordine spettrale, si associano alle frequenze più significative con tali densità le seguenti stagionalità:
+
+* Stagionalità giornaliera: ogni 24 ore.
+* Stagionalità annuale: ogni 365*24 giorni.
+* Stagionalità settimanale: ogni 7*24 giorni.
+
+Ulteriori stagionalità rimanenti sono multiple di quelle di cui sopra. 
+
+Visualizziamo queste stagionalità. 
+Iniziamo analizzando un profilo giornaliero. 
+
+Si osserva che la stagionalità non è deterministica, infatti per ogni ora del giorno si potrebbe definire una variabile casuale per quel $t$. 
+In particolare, tale profilo si caratterizza da due picchi di cui quello pomeridiano risulta anche essere globale nella stessa giornata.
+
+```{r warning=FALSE, echo = FALSE, fig.align="center", fig.width = 7,  fig.height = 4}
+plot_seasonility(df, start = 1, end = nrow(df) / 3, "day")
+```
+Per quanto riguarda la stagionalità settimanale, anch'essa è deterministica e si manifesta con gli ultimi due giorni della settimana con picchi meno pronunciati rispetto agli altri. 
+
+```{r warning=FALSE, echo = FALSE, fig.align="center", fig.width = 7,  fig.height = 4}
+
+plot_seasonility(df, start = 1, end = nrow(df) / 3, "week")
+
+```
+Avendo soltanto due anni di dati, non è possibile visualizzare la stagionalità annuale per periodi lunghi. 
+Tuttavia, è possibile notare che a causa del cambio delle stagioni, la quantità graficata risulta maggiore nei mesi invernali e quelli esitivi. In primavera sembrerebbe esserci diminuire.  
+
+```{r warning=FALSE, echo = FALSE, fig.align="center", fig.width = 7,  fig.height = 4}
+
+plot_seasonility(df, start = 1, end = nrow(df), "year")
+
+```
+
+Cerchiamo ora di capire le caratteristiche della serie storica analizzando i grafici di ACF e PACF. Si nota che entrambi i grafici sono complessi e  parecchio rumorosi sia perché stiamo usando un campione, che quindi introdurrà del rumore nelle stime delle autocorrelazioni, ed anche, ma soprattutto, perchè il proceso preso in esame raccoglie diverse caratteristiche del processo d'interesse. 
+
+
+```{r fig.align="center"}
+
+p_1 = ggAcf(data, lag.max = 370*24) 
+p_2 = ggPacf(data, lag.max = 2*24)
+ggarrange(p_1, p_2, ncol = 1, nrow = 2)
+
+rm(p_1, p_2)
+
+```
+
+Per capire se la serie è debolmente stazionaria nel tempo, la media e la deviazione standard dei dati possono fornire informazioni cruciali. 
+In particolare, si nota un trend decrescente per entrambi i casi: una differenza prima e la trasformazione logaritmica dovrebbero essere prese in considerazione.  
+
+
+```{r echo=FALSE, warning=FALSE}
+# check the mean and variance each month. 
+df$VALORE = as.numeric(df$VALORE)
+
+statistics = df %>% 
+  group_by(yr = year(DATA), mon = month(DATA)) %>% 
+  summarise(MEAN_VALORE = mean(VALORE), STD_VALORE = sd(VALORE))
+
+
+statistics = statistics %>% unite("MERGE",yr, mon, sep = "-")
+statistics$Index = 1:nrow(statistics)
+
+
+p_1 = ggplot(statistics, aes(x = Index, y = MEAN_VALORE)) + geom_point() + geom_smooth(method="lm", se=TRUE) + xlab('Month') + ylab('Mean')
+p_2 = ggplot(statistics, aes(x = Index, y = STD_VALORE)) + geom_point() + geom_smooth(method="lm", se=TRUE) + xlab('Month') + ylab('Std')
+
+p = ggarrange(p_1, p_2, ncol = 1, nrow = 2)
+
+annotate_figure(p, top = text_grob("Media e deviazione stadard per ogni mese."))
+
+rm(statistics, p_1, p_2, p)
+```
+
+
+
+## DEFINIZIONE DEI REGRESSORI
+
+Nei modelli che saranno implementati sarà necessario utilizzare dei regressori esterni per segnalare la presenza di un evento paricolare che ha influenzato l'andamento della serie storica.  
+Di conseguenza, sono stati inseriti i seguenti regressori:
+
+* Festività natalizie, i.e. 24, 25 e 26 di dicembre.
+* Capodanno.
+* Epifania.
+* Pasqua.
+* Ferragosto.
+* Immacolata.
+* Tutti i santi.
+* Festa della repubblica.
+* Festa dei lavoratori.
+* Festa della liberazione.
+* L'effetto del covid verrà definito attraverso l'aggiunta di regressori a partire dal 9 Marzo 2020 fino alla fine dei dati a disposizione. Questa sceltà è dovuta al fatto che, oltre il primo periodo di lockdown che ha sicuramente influito sui dati, anche il periodo successivo è stato intaccato dall'effetto che ha avuto il virus sulla nostra società e di conseguenza, sui dati energetici.
+
+```{r include = FALSE}
+
+#-- Aggiugiamo le festività.
+
+# Festività natalizie
+
+df = df %>% define_regressors(.)
+
+```
+
+
+## SPLIT TRAIN-TEST
+
+```{r include = FALSE}
+
+tail_train = '2020-04-01 23:00:00'
+head_val = "2020-04-02 00:00:00"
+
+appo = split_train_val(data, tail_train, head_val)
+
+train = appo[[1]]
+val  = appo[[2]]
+train %>% length(.) + val %>% length(.) == nrow(df)
+
+train_w_dummy  = appo[[3]]
+val_w_dummy  = appo[[4]]
+train_w_dummy %>% nrow(.) + val_w_dummy %>% nrow(.) == nrow(df)
+
+train_feste_dummy  = appo[[5]]
+val_feste_dummy  = appo[[6]]
+train_feste_dummy %>% nrow(.) + val_feste_dummy %>% nrow(.) == nrow(df)
+
+rm(tail_train, head_val, appo)
+
+train_to_save = train %>% data.frame()  
+train_to_save$Timestamp = train_to_save %>% rownames()
+train_to_save = train_to_save%>% `colnames<-`(c('Value', 'Timestamp'))
+
+val_to_save = val %>% data.frame()  
+val_to_save$Timestamp = val_to_save %>% rownames()
+val_to_save = val_to_save%>% `colnames<-`(c('Value', 'Timestamp'))
+
+write.csv(train_to_save, "Dataset/Train.csv", row.names = FALSE)
+write.csv(val_to_save,"Dataset/Val.csv", row.names = FALSE)
+
+```
+
+Il dataset è stato suddiviso in train e validation: il primo sarà utilizzato per addestrare i modelli e la ricerca dei parametri ed il secondo per validarlo. Le percentuali sono riportate nell'output sottostante. Si osservi che il periodo scelto incorpora il periodo del covid segnalato dalle dummy sia per il train sia per il test. 
+
+```{r echo = FALSE}
+cat("Percentuale train:", train %>% length(.) / nrow(df) * 100)
+cat("\n")
+cat("Percentuale val:", val %>% length(.) / nrow(df) * 100)
+```
+
+
+### ARIMA 
+
+La strategia adottarta prevede di cominciare a prevedere i dati del test set attraverso modelli molto più semplici dell'ARIMA, i.e. previsione della media, dell'ultima finestra dispobile o dell'ultimo punto (Naive), in modo da avere una baseline.
+
+```{r incude = FALSE}
+
+f = mean(train)
+f = rep(f, nrow(val))
+df_eval = evaluation(val, f, "Mean")
+
+f = as.numeric(train[nrow(val)])
+f = rep(f, nrow(val))
+df_eval = rbind(df_eval, evaluation(val, f, "Naive"))
+
+f = train[(nrow(train) - nrow(val) + 1):nrow(train)]
+df_eval = rbind(df_eval, evaluation(val, f, "LastWindow"))
+
+rm(f)
+
+```
+
+Successivamente, diversi modelli ARIMA sono stati implementati. L'idea è quella di definire diverse strategie, e.g. con regressori o senza, stimare diversi modelli associati a diversi valori di iperparametri e proclamare il modello vincitore per quella strategia analizzando il MAE sul test set. Questo approccio step-by-step verrà eseguito per capire qual è la componente del modello che migliora maggiormente le previsioni.
+Infine, si confronteranno i migliori modelli di ogni strategia per definire il miglior modello tra tutti. 
+La seguenti strategie sono state implementate: 
+
+* Modello ARIMA senza stagionalità. In questo specifico caso, si è deciso di applicare una grid search automatizzata dato che il tempo di esecuzione di ogni modello è ragionevole. Dopo aver individuato il miglior modello, sono state graficate le previsioni di quest'ultimo. Si osserva che le previsioni di due mesi successivi tendono seguire il trend decrescente della serie storica. Non verranno fornite ulteriori considerazioni perché il modello è incompleto. Tuttavia, rimane comunque di valore poiché evidenzia alcune caratteristiche interessanti ed inoltre, fornisce una prima baseline per le performance dei modelli ARIMA. 
+
+
+
+```{r include = FALSE}
+
+#--- MODEL DATA: ARIMA.
+# This approach cannot work with this type of data because they are too much irregular.
+
+
+# Max values of hyperparameters.
+p_max = 5
+d_max = 0 # TOLGO IL DRIFT PERHCé FA ESPLODERE GLI INTERVALLI DI CONDIDENZA. 
+q_max = 5
+
+P_max = 0
+D_max = 0
+Q_max = 0
+
+period = 0
+
+xreg_train = NULL
+xreg_test = NULL
+
+# Grid Search.
+
+result = arima_grid_search(p_min = 0, d_min = 0, q_min = 0,
+                           P_min = 0, D_min = 0, Q_min = 0,
+                           p_max, d_max, q_max,
+                           P_max, D_max, Q_max,
+                           period,
+                           xreg_train, xreg_test,
+                           train, val)
+
+best_model = result[[1]]
+f = result[[2]]
+time = result[3]
+
+best_model %>% summary()
+
+rm(result, best_model, time)
+
+```
+
+
+```{r echo = FALSE}
+plot(f) 
+```
+
+```{r include = FALSE}
+# Save the best model.
+df_eval = rbind(df_eval, evaluation(val, f$mean, "ARIMA"))
+write.csv(df_eval, "df_eval.csv")
+```
+
+
+
+* Modello ARIMA con stagionalità stocastica $s=24$. In questo caso, applicare un grid search risulta irragionevole per motivi computazionali. Per questo motivo, ogni modello di questa casistica verrà analizzato ad uno ad uno anche per prestare attenzione alla significatività dei parametri ed analizzare le caratteristiche dei residui (gaussianità, autocorrelazione etc.) con più dettaglio. Si partirà dunque da un modello semplice per aumentare la complessità e capire se gli iperparametri aggiunti sono significativi o meno. 
+Si osserva che, considerando modelli del tipo $(p,0,q)(P,0,Q)_{24}$, l'aggiunta delle componenti SAR e SMA sono indubbiamente quelle che hanno maggior impatto sulla qualità delle previsioni perché altrimenti, il segnale non riuscirebbe a catturare la stagionalità giornaliera nel lungo periodo.
+Tuttavia, un modello siffatto non può essere sufficiente perché almeno una differenza stagionale è d'obbligo per eliminare la stagionalità giornaliera la quale è fonte di non stazionarietà. In particolare, anche nei modelli più semplici, tale differenza permette di catturare il pattern stagionale giornaliero per lunghi periodi. 
+
+Una differenza semplice introduce un importante trend crescente che non è significativo per le previsioni. Inoltre, tale modello si caartterizza da intervalli di confidenza esageratamente grandi per previsioni a lungo termine. Di conseguenza, non è sicuramente uno dei modelli preferibili. 
+
+Dopo una prima parte di esplorazione, si è voluta definire una grid search sui modelli $(p,0,q)(P,1,Q)_{24}$ dato che sembrano essere i migliori rispetto a quelli citati precedentemente. 
+
+```{r include = FALSE}
+
+ggAcf(diff(log(train), 24), lag.max = 24*10)
+ggPacf(diff(log(train), 24), lag.max = 24*10)
+
+```
+
+
+```{r include = FALSE}
+
+# corto termine: riesce a captare l'andamento corretto solo un giorno
+# in avanti, pari alla stagonalità.
+# lungo termine: media della serie. 
+
+# include.constant mi dà una media significativa, mentre 
+# include.drift non lo è. 
+
+p = 2; d = 0; q = 0; 
+P = 0; D = 0; Q = 1; 
+
+mod = Arima(train, 
+      c(p,d,q),
+      list(order = c(P,D,Q), period = 24),
+      lambda = 0,
+      include.constant = TRUE # per modelli senza differenze viene aggiunta di default. 
+      ) 
+
+```
+
+```{r}
+mae_score = mod %>% check_arima(., val)
+```
+
+```{r}
+# save result
+table_result = data.frame() 
+table_result = rbind(table_result, c(p,d,q, P,D,Q, mae_score[1], mae_score[2], 'D', 24))
+names(table_result) <- c('p', 'd', 'q', 'P', 'D', 'Q', 'MAE_TRAIN', 'MAE_TEST', 'SEASONALITY', 'TYPE_SEASON')
+write.csv(table_result, "table_result.csv")
+```
+
+
+```{r include = FALSE}
+
+# corto termine: riesce ad prevedere le stagionalità 
+# lungo termine: si contrae
+# il ciclo non ha persistenza nel tempo
+rm(mod, mae_score)
+
+p = 2; d = 0; q = 0; 
+P = 1; D = 0; Q = 0; 
+
+mod = Arima(train, 
+      c(p,d,q),
+      list(order = c(P,D,Q), period = 24),
+      lambda = 0,
+      include.constant = TRUE
+      ) 
+```
+
+```{r}
+mae_score = mod %>% check_arima(., val)
+```
+
+```{r}
+table_result = rbind(table_result, c(p,d,q, P,D,Q, mae_score[1], mae_score[2], 'D', 24))
+write.csv(table_result, "table_result.csv")
+```
+
+
+```{r include = FALSE}
+
+rm(mod, mae_score)
+
+# cattura meglio la parte stagionale ma si riduce sempre di più, come un imbuto.
+p = 2; d = 0; q = 0; 
+P = 1; D = 0; Q = 1; 
+
+mod = Arima(train, 
+      c(p,d,q),
+      list(order = c(P,D,Q), period = 24),
+      lambda = 0,
+      include.constant = TRUE
+      ) 
+```
+
+```{r}
+mae_score = mod %>% check_arima(., val)
+```
+
+```{r}
+table_result = rbind(table_result, c(p,d,q, P,D,Q, mae_score[1], mae_score[2], 'D', 24))
+write.csv(table_result, "table_result.csv")
+```
+
+```{r include = FALSE}
+
+rm(mod, mae_score)
+
+p = 4; d = 0; q = 0; 
+P = 1; D = 0; Q = 1; 
+
+mod = Arima(train, 
+      c(p,d,q),
+      list(order = c(P,D,Q), period = 24),
+      lambda = 0,
+      include.constant = TRUE) 
+```
+
+```{r}
+mae_score = mod %>% check_arima(., val)
+```
+
+```{r}
+table_result = rbind(table_result, c(p,d,q, P,D,Q, mae_score[1], mae_score[2], 'D', 24))
+write.csv(table_result, "table_result.csv")
+```
+
+
+```{r include = FALSE}
+
+rm(mod, mae_score)
+
+p = 4; d = 0; q = 1; 
+P = 1; D = 0; Q = 1; 
+
+mod = Arima(train, 
+      c(p,d,q),
+      list(order = c(P,D,Q), period = 24),
+      lambda = 0,
+      include.constant = TRUE
+      ) 
+```
+
+```{r}
+mae_score = mod %>% check_arima(., val)
+```
+
+```{r}
+table_result = rbind(table_result, c(p,d,q, P,D,Q, mae_score[1], mae_score[2], 'D', 24))
+write.csv(table_result, "table_result.csv")
+```
+
+```{r include = FALSE}
+
+rm(mod, mae_score)
+
+p = 5; d = 0; q = 1; 
+P = 1; D = 0; Q = 1; 
+
+mod = Arima(train, 
+      c(p,d,q),
+      list(order = c(P,D,Q), period = 24),
+      lambda = 0,
+      include.constant = TRUE
+      ) 
+```
+
+```{r}
+mae_score = mod %>% check_arima(., val)
+```
+
+```{r}
+table_result = rbind(table_result, c(p,d,q, P,D,Q, mae_score[1], mae_score[2], 'D', 24))
+write.csv(table_result, "table_result.csv")
+```
+
+```{r include = FALSE}
+
+rm(mod, mae_score)
+
+# con Q = 2, l'imbuto si stringe di meno con il tempo. 
+p = 6; d = 0; q = 0; 
+P = 1; D = 0; Q = 1; 
+
+mod = Arima(train, 
+      c(p,d,q),
+      list(order = c(P,D,Q), period = 24),
+      lambda = 0,
+      include.constant = TRUE
+      ) 
+```
+
+```{r}
+mae_score = mod %>% check_arima(., val)
+```
+
+```{r}
+table_result = rbind(table_result, c(p,d,q, P,D,Q, mae_score[1], mae_score[2], 'D', 24))
+write.csv(table_result, "table_result.csv")
+```
+
+```{r include = FALSE}
+
+rm(mod, mae_score)
+
+p = 5; d = 0; q = 0; 
+P = 1; D = 0; Q = 2; 
+
+mod = Arima(train, 
+      c(p,d,q),
+      list(order = c(P,D,Q), period = 24),
+      lambda = 0,
+      include.constant = TRUE
+      ) 
+```
+
+```{r}
+mae_score = mod %>% check_arima(., val)
+```
+
+```{r}
+table_result = rbind(table_result, c(p,d,q, P,D,Q, mae_score[1], mae_score[2], 'D', 24))
+write.csv(table_result, "table_result.csv")
+```
+
+
+```{r include = FALSE}
+
+rm(mod, mae_score)
+# potrei fare con AR(5) ma è un poì pesante.
+p = 4; d = 0; q = 1; 
+P = 1; D = 0; Q = 2; 
+
+mod = Arima(train, 
+      c(p,d,q),
+      list(order = c(P,D,Q), period = 24),
+      lambda = 0,
+      include.constant = TRUE
+      ) 
+```
+
+```{r}
+mae_score = mod %>% check_arima(., val)
+```
+
+```{r}
+table_result = rbind(table_result, c(p,d,q, P,D,Q, mae_score[1], mae_score[2], 'D', 24))
+write.csv(table_result, "table_result.csv")
+```
+
+
+```{r include = FALSE}
+
+rm(mod, mae_score)
+# AR(4) ha un problema nella convergenza.
+#SAR(2) non significativo. 
+p = 5; d = 0; q = 0; 
+P = 2; D = 0; Q = 2; 
+
+mod = Arima(train, 
+      c(p,d,q),
+      list(order = c(P,D,Q), period = 24),
+      lambda = 0,
+      include.constant = TRUE
+      ) 
+```
+
+```{r}
+mae_score = mod %>% check_arima(., val)
+```
+
+```{r}
+table_result = rbind(table_result, c(p,d,q, P,D,Q, mae_score[1], mae_score[2], 'D', 24))
+write.csv(table_result, "table_result.csv")
+```
+
+
+```{r include = FALSE}
+
+rm(mod, mae_score)
+# SAR(3) non significativo.
+p = 5; d = 0; q = 0; 
+P = 1; D = 0; Q = 3; 
+
+mod = Arima(train, 
+      c(p,d,q),
+      list(order = c(P,D,Q), period = 24),
+      lambda = 0,
+      include.constant = TRUE) 
+```
+
+```{r}
+mae_score = mod %>% check_arima(., val)
+```
+
+```{r}
+table_result = rbind(table_result, c(p,d,q, P,D,Q, mae_score[1], mae_score[2], 'D', 24))
+write.csv(table_result, "table_result.csv")
+```
+
+
+```{r include = FALSE}
+
+rm(mod, mae_score)
+
+# Aggiungo l'integrazione.
+p = 1; d = 0; q = 0; 
+P = 0; D = 1; Q = 1; 
+
+mod = Arima(train, 
+      c(p,d,q),
+      list(order = c(P,D,Q), period = 24),
+     #  include.constant = TRUE, non significativa
+      lambda = 0
+      ) 
+
+# niente MAE TEST: 1492044075
+# constant MAE test: 1626859198
+# drift MAE TEST: 1626859198
+```
+
+```{r}
+mae_score = mod %>% check_arima(., val)
+```
+
+```{r}
+table_result = rbind(table_result, c(p,d,q, P,D,Q, mae_score[1], mae_score[2], 'D', 24))
+write.csv(table_result, "table_result.csv")
+```
+
+```{r include = FALSE}
+
+rm(mod, mae_score)
+
+p = 1; d = 1; q = 0; 
+P = 1; D = 1; Q = 1; 
+
+mod = Arima(train, 
+      c(p,d,q),
+      list(order = c(P,D,Q), period = 24),
+      lambda = 0,
+      include.constant = TRUE
+      ) 
+```
+
+```{r}
+mae_score = mod %>% check_arima(., val)
+```
+
+```{r}
+table_result = rbind(table_result, c(p,d,q, P,D,Q, mae_score[1], mae_score[2], 'D', 24))
+write.csv(table_result, "table_result.csv")
+```
+
+```{r}
+table_result %>% arrange(MAE_TEST)
+```
+
+
+```{r include = FALSE}
+
+#--- MODEL DATA: ARIMA.
+# This approach cannot work with this type of data because they are too much irregular.
+
+# Grid Search.
+"
+result = arima_grid_search(p_min = 1, 
+                           d_min = 0, 
+                           q_min = 1,
+                           P_min = 1, 
+                           D_min = 1, 
+                           Q_min = 1,
+                           p_max = 5, 
+                           d_max = 0, 
+                           q_max = 3,
+                           P_max = 2, 
+                           D_max = 1, 
+                           Q_max = 1,
+                           period = 24,
+                           xreg_train, 
+                           xreg_test,
+                           train, 
+                           val)
+
+best_model = result[[1]]
+f = result[[2]]
+best_model %>% summary()
+"
+
+# Il miglior risultato è (5,0,3)(2,1,1)_24 senza costante, trasf. log
+
+# rm(result, best_model, time)
+
+
+#rm(mod, mae_score)
+
+p = 5; d = 0; q = 3; 
+P = 2; D = 1; Q = 1; 
+best_model = Arima(train, 
+      c(p,d,q),
+      list(order = c(P,D,Q), period = 24),
+      lambda = 0,
+      include.constant = FALSE
+      ) 
+
+
+```
+
+```{r include = FALSE}
+mae_score = best_model %>% check_arima(., val)
+```
+
+```{r}
+table_result = rbind(table_result, c(p,d,q, P,D,Q, mae_score[1], mae_score[2], 'D', 24))
+write.csv(table_result, "table_result.csv")
+```
+
+
+```{r echo = FALSE}
+f = forecast(best_model, h = 24*10)
+plot(f, include = 24*10)
+```
+
+```{r include=FALSE}
+f = forecast(best_model, h = length(val))
+df_eval = rbind(df_eval, evaluation(val, f$mean, "ARIMA24Stag"))
+write.csv(df_eval, "df_eval.csv")
+```
+
+
+
+
+* Modello ARIMA con stagionalità $s=24$ stocastica e $s=7*24$ deterministica con dummy. Questa scelta deriva dal fatto che la stagionalità settimanale è abbastanza ruvida: sarebbero necessarie diverse sinusoidi per modellarle contro i sei regressori che devo introdurre con le dummy. 
+Il modello arima di base che verrà considerato è il migliore ottenuto senza l'aggiunta delle dummy. 
+Si osserva che i coefficienti delle dummy non risultano essere singificativi e non vi è una chiara diminuzione della variabile d'interesse nel weekend: queso approccio non funziona. 
+
+```{r include = FALSE}
+rm(mod, mae_score)
+
+col = c("WDAY_dom",
+        "WDAY_mar",
+        "WDAY_mer",
+        "WDAY_gio",
+        "WDAY_ven",
+        "WDAY_sab"
+)
+
+p = 5; d = 0; q = 3;
+P = 2; D = 1; Q = 1;
+
+mod = tryCatch({Arima(train,
+      c(p,d,q),
+      list(order = c(P,D,Q), period = 24),
+      lambda = 0,
+      include.constant = FALSE,
+      xreg = as.matrix(train_w_dummy[,col])
+      )}, error=function(e){print(e)})
+
+# la maggior parte deu regressori non sono significativi.
+mod %>% summary()
+
+```
+
+
+* Modello ARIMA con stagionalità $s=24$ stocastica e $s=7*24$ deterministica con sinusoidi. Questi modelli risultano essere problematici: alcuni non convergono ed i rimanenti richiedono un tempo computazionale non sostenibili. Di conseguenza, per tenere in considerazione questa stagionalità, un'altra strategia dovrà essere implementata.  
+
+```{r include = FALSE}
+
+reg_w_16 = reg_one_s(train, val, 16, 24*7)
+reg_w_32 = reg_one_s(train, val, 32, 24*7)
+reg_w_48 = reg_one_s(train, val, 48, 24*7)
+
+```
+
+
+```{r include = FALSE}
+
+rm(mod, mae_score)
+
+
+p = 5; d = 0; q = 3; 
+P = 2; D = 1; Q = 1; 
+
+mod = tryCatch({Arima(train,
+                      c(p,d,q),
+                      list(order = c(P,D,Q), period = 24),
+                      lambda = 0,
+                      include.constant = TRUE,
+                      xreg = reg_w_16[[1]])
+      }, error=function(e){print(e)})
+```
+
+
+```{r include = FALSE}
+
+rm(mod, mae_score)
+
+p = 5; d = 0; q = 3; 
+P = 2; D = 1; Q = 1; 
+
+mod = tryCatch({Arima(train,
+                      c(p,d,q),
+                      list(order = c(P,D,Q), period = 24),
+                      lambda = 0,
+                      include.constant = TRUE,
+                      xreg = reg_w_32[[1]])
+      }, error=function(e){print(e)})
+
+```
+
+
+
+```{r include = FALSE}
+rm(mod, mae_score)
+
+p = 5; d = 0; q = 3; 
+P = 2; D = 1; Q = 1; 
+
+mod = tryCatch({Arima(train,
+                      c(p,d,q),
+                      list(order = c(P,D,Q), period = 24),
+                      lambda = 0,
+                      include.constant = TRUE,
+                      xreg = reg_w_48[[1]])
+      }, error=function(e){print(e)})
+
+```
+
+
+
+
+* Modello ARIMA con stagionalità $s=24*7$ stocastica. Questa scelta potrebbe essere la chiave vincente per tenere in considerazione sia la stagionalità giornaliera sia quella settimanale (dato che quest'ultima è un multiplo della prima) senza doverle modellare separatamente come sopra. 
+Analizziamo i grafici di Acf e Pacf della serie $log(diff(ts, 24*7))$. Nel primo si osserva un'oscillazione dei valori delle autocorrelazioni i quali evidenziano la presenza di un processo autoregressivo di ordine $2$, come suggerisce il grafico Pacf. 
+Non sembrano esserci dei processi MA non stagionali. 
+Per quanto riguarda la parte stagionale a $s=24*7$, sia il grafico Acf sia la Pacf mostrano picchi significativi per i suoi multipli. 
+Sicuramente viè una componente MA stagionale dovuta alla differenza che viene evidenziata dal picco negativo a $s=24*7$ nella Acf e dai picchi sistematici negativi nella Pacf. 
+I grafici suggeriscono anche la presenza di una componente autoregressiva stagionale. 
+
+
+```{r echo = TRUE}
+
+p_1 = ggAcf(diff(log(train), 24*7), lag.max = 24*10)
+p_2 = ggPacf(diff(log(train), 24*7), lag.max = 24*10)
+
+ggarrange(p_1, p_2, ncol = 1, nrow = 2)
+
+rm(p_1, p_2)
+```
+
+
+```{r include=FALSE}
+rm(mod, mae_score)
+
+p = 2; d = 0; q = 0;
+P = 1; D = 1; Q = 1; 
+
+mod = Arima(train, 
+      c(p,d,q),
+      list(order = c(P,D,Q), period = 24*7),
+      lambda = 0,
+      include.constant = TRUE,
+      method = "CSS") 
+```
+
+```{r include=FALSE}
+mae_score = mod %>% check_arima(., val)
+```
+
+```{r include=FALSE}
+table_result = rbind(table_result, c(p,d,q, P,D,Q, mae_score[1], mae_score[2], 'W', 168))
+write.csv(table_result, "table_result.csv")
+```
+
+
+```{r include=FALSE}
+rm(mod, mae_score)
+
+p = 2; d = 0; q = 1;
+P = 1; D = 1; Q = 1; 
+
+mod = Arima(train, 
+      c(p,d,q),
+      list(order = c(P,D,Q), period = 24*7),
+      lambda = 0,
+      include.constant = TRUE,
+      method = "CSS") 
+```
+
+```{r}
+mae_score = mod %>% check_arima(., val)
+```
+
+```{r include=FALSE}
+table_result = rbind(table_result, c(p,d,q, P,D,Q, mae_score[1], mae_score[2], 'W', 168))
+write.csv(table_result, "table_result.csv")
+```
+
+```{r}
+rm(mod, mae_score)
+
+p = 3; d = 0; q = 1;
+P = 1; D = 1; Q = 1; 
+
+mod = Arima(train, 
+      c(p,d,q),
+      list(order = c(P,D,Q), period = 24*7),
+      lambda = 0,
+      include.constant = TRUE,
+      method = "CSS") 
+```
+
+```{r}
+mae_score = mod %>% check_arima(., val)
+```
+
+```{r}
+table_result = rbind(table_result, c(p,d,q, P,D,Q, mae_score[1], mae_score[2], 'W', 168))
+write.csv(table_result, "table_result.csv")
+```
+
+```{r}
+rm(mod, mae_score)
+
+p = 4; d = 0; q = 1;
+P = 1; D = 1; Q = 1; 
+
+mod = Arima(train,
+            c(p,d,q),
+            list(order = c(P,D,Q), period = 24*7),
+            lambda = 0,
+            include.constant = TRUE,
+            method = "CSS")
+```
+
+```{r}
+mae_score = mod %>% check_arima(., val)
+```
+
+```{r}
+table_result = rbind(table_result, c(p,d,q, P,D,Q, mae_score[1], mae_score[2], 'W', 168))
+write.csv(table_result, "table_result.csv")
+```
+
+```{r include = FALSE}
+
+# Non funziona. 
+rm(mod, mae_score)
+
+p = 5; d = 0; q = 1;
+P = 1; D = 1; Q = 1; 
+
+mod = Arima(train,
+            c(p,d,q),
+            list(order = c(P,D,Q), period = 24*7),
+            lambda = 0,
+            include.constant = TRUE,
+            method = "CSS"
+            )
+# mae_score = mod %>% check_arima(., val)
+```
+
+```{r include = FALSE}
+
+# dà errore.
+rm(mod, mae_score)
+
+p = 6; d = 0; q = 1;
+P = 1; D = 1; Q = 1; 
+
+mod = tryCatch({Arima(train,
+                      c(p,d,q),
+                      list(order = c(P,D,Q), period = 24*7),
+                      lambda = 0,
+                      # include.constant = TRUE,
+                      method = "CSS")
+      }, error=function(e){cat("\n ERROR : There is a problem. Skip this parameter set. \n")})
+
+# mae_score = mod %>% check_arima(., val)
+```
+
+
+```{r}
+rm(mod, mae_score)
+
+p = 3; d = 0; q = 2;
+P = 1; D = 1; Q = 1; 
+
+mod = Arima(train, 
+      c(p,d,q),
+      list(order = c(P,D,Q), period = 24*7),
+      lambda = 0,
+      include.constant = TRUE,
+      method = "CSS") 
+```
+
+```{r}
+mae_score = mod %>% check_arima(., val)
+```
+
+```{r}
+table_result = rbind(table_result, c(p,d,q, P,D,Q, mae_score[1], mae_score[2], 'W', 168))
+write.csv(table_result, "table_result.csv")
+```
+
+```{r}
+table_result %>% arrange(MAE_TEST)
+```
+
+
+```{r include=FALSE}
+# rm(mod, mae_score)
+
+p = 3; d = 0; q = 2;
+P = 1; D = 1; Q = 1; 
+
+best_mod = Arima(train, 
+      c(p,d,q),
+      list(order = c(P,D,Q), period = 24*7),
+      lambda = 0,
+      include.constant = TRUE,
+      method = "CSS") 
+
+
+mae_score = best_mod %>% check_arima(., val)
+f = forecast(best_mod, h = length(val))
+df_eval = rbind(df_eval, evaluation(val, f$mean, "ARIMA_24*7"))
+write.csv(df_eval, "df_eval.csv")
+```
+
+
+* Modello ARIMA con stagionalità $s=7*24$ stocastica, $s=24*365$ deterministica con funzioni oscillanti e regresori esterni per tenere conto delle vacanze. Per questi modelli è necessario utilizzare il logaritmo come trasformazione iniziale altrimenti il modello Arima segnala dei problemi legati al processo di ottimizzazione. 
+
+
+```{r include=FALSE}
+# regressori per l'anno e le feste. 
+
+reg_y_8 = reg_one_s(train, val, 8, 24*365.25)
+reg_y_16 = reg_one_s(train, val, 16, 24*365.25)
+reg_y_32 = reg_one_s(train, val, 32, 24*365.25)
+
+```
+
+```{r include=FALSE}
+
+rm(mod, mae_score)
+
+p = 3; d = 0; q = 2;
+P = 1; D = 1; Q = 1; 
+
+mod = Arima(train, 
+            c(p,d,q),
+            list(order = c(P,D,Q), period = 24*7),
+            xreg = reg_y_8[[1]],
+            lambda = 0,
+            include.constant = TRUE,    
+            method = "CSS"
+            ) 
+```
+
+```{r}
+mae_score = mod %>% check_arima(., val, test_reg = reg_y_8[[2]] %>% data.matrix(.))
+```
+
+```{r include=FALSE}
+table_result = rbind(table_result, c(p,d,q, P,D,Q, mae_score[1], mae_score[2], 'W_Y_8', 168))
+write.csv(table_result, "table_result.csv")
+```
+
+```{r include=FALSE}
+
+rm(mod, mae_score)
+
+p = 3; d = 0; q = 2;
+P = 1; D = 1; Q = 1; 
+
+mod = Arima(train, 
+            c(p,d,q),
+            list(order = c(P,D,Q), period = 24*7),
+            xreg = reg_y_16[[1]],
+            include.constant = TRUE,  
+            lambda = 0,
+            method = "CSS") 
+```
+
+```{r}
+mae_score = mod %>% check_arima(., val, test_reg = reg_y_16[[2]] %>% data.matrix(.))
+```
+
+```{r}
+table_result = rbind(table_result, c(p,d,q, P,D,Q, mae_score[1], mae_score[2], 'W_Y_16', 168))
+write.csv(table_result, "table_result.csv")
+```
+
+
+```{r include=FALSE}
+
+rm(mod, mae_score)
+
+p = 3; d = 0; q = 2;
+P = 1; D = 1; Q = 1; 
+
+mod = Arima(train, 
+            c(p,d,q),
+            list(order = c(P,D,Q), period = 24*7),
+            xreg = reg_y_32[[1]],
+            include.constant = TRUE,              
+            lambda = 0,
+            method = "CSS") 
+```
+
+```{r include=FALSE}
+mae_score = mod %>% check_arima(., val, test_reg = reg_y_32[[2]] %>% data.matrix(.))
+```
+
+```{r include=FALSE}
+table_result = rbind(table_result, c(p,d,q, P,D,Q, mae_score[1], mae_score[2], 'W_Y_32', 168))
+table_result = table_result %>% arrange(MAE_TEST)
+write.csv(table_result, "table_result.csv")
+```
+
+```{r include=FALSE}
+
+rm(mod, mae_score)
+
+# train_feste_dummy = train_feste_dummy[,c("Mag1","Nov1", "Covid")]
+#test_feste_dummy = val_feste_dummy[,c("Mag1", "Nov1", "Covid")]
+
+reg_tot_train = cbind(reg_y_16[[1]], train_feste_dummy) %>% data.matrix(.)
+reg_tot_val = cbind(reg_y_16[[2]], val_feste_dummy) %>% data.matrix(.)
+
+#Non significaivi: Dic24, Dic25, Dic26, Gen1, Gen6, Pasqua, Pasquetta, Ago15, Dic8, Giu2, Mag1, Apr25
+
+p = 3; d = 0; q = 2;
+P = 1; D = 1; Q = 1;  
+
+mod = Arima(train, 
+            c(p,d,q),
+            list(order = c(P,D,Q), period = 24*7),
+            xreg = reg_tot_train,
+            lambda = 0,
+            include.constant = TRUE,               
+            method = "CSS") 
+mod %>% summary()
+```
+
+
+```{r include=FALSE}
+
+rm(mod, mae_score)
+
+train_feste_dummy = train_feste_dummy[,c("Mag1","Nov1", "Covid")]
+val_feste_dummy = val_feste_dummy[,c("Mag1", "Nov1", "Covid")]
+
+reg_tot_train = cbind(reg_y_16[[1]], train_feste_dummy) %>% data.matrix(.)
+reg_tot_val = cbind(reg_y_16[[2]], val_feste_dummy) %>% data.matrix(.)
+
+#Non significaivi: Dic24, Dic25, Dic26, Gen1, Gen6, Pasqua, Pasquetta, Ago15, Dic8, Giu2, Mag1, Apr25
+
+p = 3; d = 0; q = 2;
+P = 1; D = 1; Q = 1;  
+
+mod = Arima(train, 
+            c(p,d,q),
+            list(order = c(P,D,Q), period = 24*7),
+            xreg = reg_tot_train,
+            include.constant = TRUE,               
+            lambda = 0,
+            method = "CSS") 
+
+mod %>% summary()
+wind = length(val)
+f = forecast(mod, h=wind, xreg = reg_tot_val)
+title = paste('Forecast', wind, 'hours')
+plot(f, include = wind, main = title)
+plot(f, include = wind)
+plot(f, main = title)
+
+
+f = data.frame(f)[,1]
+mae_test = mean(abs(as.numeric(val) - f))
+cat('MAE for test set:', mae_test)
+
+plot(as.numeric(val), type = 'l', col = 'black', ylim=c(min(val_prediction), max(val_prediction)), xlab = 'Index', ylab = 'Value')
+lines(f, col = "red")
+legend(1,7e6, legend=c("Validation data", "ARIMA predictions"),
+       col=c("black", "red"), lty=c(1,1))
+
+
+```
+
+```{r}
+mae_score = mod %>% check_arima(., val, test_reg = reg_tot_val)
+```
+
+```{r}
+table_result = rbind(table_result, c(p,d,q, P,D,Q, mae_score[1], mae_score[2], 'TOTAL_REG', 168))
+table_result %>% arrange((MAE_TEST))
+write.csv(table_result, "table_result.csv")
+```
+
+```{r}
+f = forecast(mod, h=length(val), xreg = reg_tot_val)
+df_eval = rbind(df_eval, evaluation(val, f$mean, "ARIMA_24*7_Sin_Reg"))
+write.csv(df_eval, "df_eval.csv")
+```
+
+
+
+```{r}
+
+# Moldello pee prevedere il test set.
+
+feste_dummy = rbind(train_feste_dummy, val_feste_dummy)
+reg_oscillanti = rbind(reg_y_16[[1]], reg_y_16[[2]])
+reg_tot = cbind(feste_dummy, reg_oscillanti)
+reg_tot %>% dim()
+
+p = 3; d = 0; q = 2;
+P = 1; D = 1; Q = 1; 
+
+# Define the final model. 
+mod = Arima(data, 
+            c(p,d,q),
+            list(order = c(P,D,Q), period = 24*7),
+            xreg = reg_tot %>% data.matrix(),
+            lambda = 0,
+            include.constant = TRUE,
+            method = "CSS") 
+mod %>% summary()
+```
+
+```{r}
+
+# Data per il test set.
+
+val %>% tail()
+test_data = seq(as.POSIXct("2020-09-01 01:00:00"), as.POSIXct("2020-11-01 00:00:00"), by="hour")
+test_data %>% head()
+
+df_test = data.frame("DATA" = test_data)
+df_test$Mag1 = rep(0, nrow(df_test))
+df_test$Nov1 = rep(0, nrow(df_test))
+df_test$Covid = rep(1, nrow(df_test))
+
+# Regressori per il test set.
+# test_data %>% length() 
+
+tempo = 1:dim(df_test)[1] # passi della serie storica.
+n = 16
+s = 24*365.25
+vj = 1:n
+freq = outer(tempo, vj)*2*pi/(s) 
+X = cbind(cos(freq), sin(freq))
+colnames(X) = c(paste0("cos", vj), paste0("sin", vj))
+X = cbind(df_test[,c("Mag1", "Nov1", "Covid")], X) %>% data.matrix()
+
+wind = dim(X)[1]
+
+f = forecast(mod, h=wind, xreg = X)
+plot(f)
+
+```
+
+
+```{r include = FALSE}
+
+# Write on CSV
+
+df_test = df_test %>% separate(DATA, c("DATE", "HOUR"), sep = " ")
+
+df_test$HOUR = apply(df_test, 1, FUN = standard_format)
+
+for (i in 1:nrow(df_test)){
+  if (df_test$HOUR[i] == 24){
+    df_test$DATE[i] = df_test$DATE[i-1]
+  }
+}
+
+df_final = cbind(df_test[, c("DATE", "HOUR")], f$mean)
+df_final = df_final %>% `colnames<-`(c("Data", "Ora", "ARIMA"))
+
+df_final$ARIMA = as.integer(df_final$ARIMA)
+str(df_final)
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+### UCM
+
+Dopo aver analizzato i modelli ARIMA, le componenti non osservabili della serie d'interesse sono piuttosto chiare: trend globalmente decrescente, stagionalità giornaliera, settimanale ed annuale ed infine, dei regressori che tengano in conderazioni il covid e le festività. 
+Modellare il trend, la stagionalità giornaliera con le dummy e settimanale con le funzioni oscillanti è lineare. Tuttavia, introducendo anche la componente che tiene conto dell'andamento annuale, il modello presenta dei problemi di overflow nella stima della massima verosomiglianza. Di conseguenza, una trasformazione della serie è stata effettuata: una trasformazione logaritmica non è sufficiente ma lo è la divisione per una costante. Inoltre, per fornire stabilità al modello, non sono state utilizzate delle condizioni iniziali diffuse. 
+Modificando gli iperparametri che definiscono le condizioni iniziali è stato possibile individuare il miglior modello. 
+
+```{r}
+# train = read.csv('Train.csv')
+# train = train['Value']
+# val = read.csv('Val.csv')
+# val = val['Value']
+
+CONSTANT = 100000
+y = c(as.numeric((train[1:nrow(train),])) / CONSTANT, rep(NA, length(val)))
+vy = var(y, na.rm = TRUE)
+md = mean(y, na.rm = TRUE)
+```
+
+
+```{r}
+
+nh = 4
+
+mod = SSModel(as.numeric(y) ~ (SSMtrend(2, list(NA, NA)) + 
+                SSMseasonal(24, NA, "dummy") + 
+                SSMseasonal(24*7, NA, "trig", harmonics = 1:nh) +
+                SSMseasonal(24*365, NA, "trig", harmonics = 1:nh)),
+              H = NA)
+
+# altrimenti ci mette troppo tempo.
+mod$P1inf[] = 0
+diag(mod$P1) = vy
+mod$a1[1] = md
+
+updt = function(pars, model, nh) {
+  
+  model$Q[1, 1, 1] = exp(pars[1])
+  
+  model$Q[2, 2, 1] = exp(pars[2])
+  
+  model$Q[3, 3, 1] = exp(pars[3])
+  
+  diag(model$Q[4:(4 + 2*nh-1), 4:(4 + 2*nh-1), 1]) = exp(pars[4])
+  
+  diag(model$Q[(4 + 2*nh):(4 + 2*nh + 2*nh-1),
+               (4 + 2*nh):(4 + 2*nh + 2*nh-1), 1]) = exp(pars[5])
+  
+  model$H[1, 1, 1] = exp(pars[6])
+  
+  model
+}
+
+# con meno iterazioni ottengo un trend. 
+fit1 = fitSSM(mod, 
+              log(c(vy/1000000, 
+                    vy/1000000, 
+                    vy/100, 
+                    vy/10000,
+                    vy/100000, 
+                    vy/10 # deve essere più grande del valore iniziale per il trend. 
+                    )),
+              updt,
+              update_args =  list(nh = nh),  control = list(maxit = 500)
+              )
+
+# non si arriva ad una convergenza: bisogn aaumentare il numero di iterazioni.
+fit1$optim.out$convergence
+
+# Filtro di Kalman per valutare le previsioni. 
+kfs1 <- KFS(fit1$model, smoothing = c("state", "signal", "disturbance"))
+
+kfs1$muhat %>% length()
+
+# train_prediction = kfs1$a[1:length(train),mod$Z == 1] %>% rowSums()
+# train_prediction = train_prediction*CONSTANT # come l'ARIMA, i valori fitted so o le previsioni one-ahead
+val_prediction = kfs1$muhat[(length(train)+1):length(y)]*CONSTANT
+val_prediction %>% length()
+
+# mae_train = mean(abs(train - train_prediction))
+mae_val = mean(abs(val - val_prediction))
+
+k = 24*30
+
+tot_sum = kfs1$alphahat[1:k,mod$Z == 1] %>% rowSums() %>% as.numeric()
+plot(tot_sum, type='l', col = 'brown', ylim = c(min(tot_sum)-30, max(tot_sum)+100))
+lines(kfs1$alphahat[1:k,'level'] + kfs1$alphahat[1:k, 3], type='l', col = 'red')
+lines(kfs1$alphahat[1:k,'level'], type='l', col = 'green')
+lines(kfs1$alphahat[1:k,'level'] + kfs1$alphahat[1:k,3] + kfs1$alphahat[1:k, seq(2 + 23, 2 + 23 + 2*nh)] %>% rowSums(), type='l', col = 'blue')
+lines(y[1:k], col = 'black')
+# par(xpd = TRUE)
+legend("topleft", legend=c('LLT + Dummy[24] + Trig[24*7] + Trig[24*365]', "LLT + Dummy[24]", "LLT", 'LLt + Dummy[24] + Trig[24*7]'), col=c("red", "green", "blue"), lty = rep(1,3))
+
+
+# si osserva questo trend crescente: le varianze del trend sono troppo elevate.
+plot(as.numeric(val), type = 'l', col = 'black', ylim=c(min(val_prediction), max(val_prediction)))
+lines(val_prediction, col = "red")
+
+result_UCM = data.frame()
+result_UCM = rbind(result_UCM, c("Mod_1", mae_val))
+result_UCM = result_UCM %>% `colnames<-`(c("Modello", "MAE"))
+write.csv(result_UCM, 'result_UCM.csv')
+```
+
+
+```{r}
+
+# Cambia il numero di sinusoidi.
+
+rm(fit1, kfs1, mod)
+
+nh = 8
+
+mod = SSModel(as.numeric(y) ~ (SSMtrend(2, list(NA, NA)) + 
+                SSMseasonal(24, NA, "dummy") + 
+                SSMseasonal(24*7, NA, "trig", harmonics = 1:nh) +
+                SSMseasonal(24*365, NA, "trig", harmonics = 1:nh)),
+              H = NA)
+
+mod$P1inf[] = 0
+diag(mod$P1) = vy
+mod$a1[1] = md
+
+updt = function(pars, model, nh) {
+  
+  model$Q[1, 1, 1] = exp(pars[1])
+  
+  model$Q[2, 2, 1] = exp(pars[2])
+  
+  model$Q[3, 3, 1] = exp(pars[3])
+  
+  diag(model$Q[4:(4 + 2*nh-1), 4:(4 + 2*nh-1), 1]) = exp(pars[4])
+  
+  diag(model$Q[(4 + 2*nh):(4 + 2*nh + 2*nh-1),
+               (4 + 2*nh):(4 + 2*nh + 2*nh-1), 1]) = exp(pars[5])
+  
+  model$H[1, 1, 1] = exp(pars[6])
+  
+  model
+}
+
+# con meno iterazioni ottengo un trend. 
+fit1 = fitSSM(mod, 
+              log(c(vy/1000000, 
+                    vy/1000000, 
+                    vy/100, 
+                    vy/10000, 
+                    vy/100000, 
+                    vy/10)),
+              updt,
+              update_args =  list(nh = nh),  control = list(maxit = 500)
+              )
+
+fit1$optim.out$convergence
+
+# Filtro di kalman.
+kfs1 <- KFS(fit1$model, smoothing = c("state", "signal", "disturbance"))
+
+kfs1$muhat %>% length()
+
+# train_prediction = kfs1$a[1:length(train),mod$Z == 1] %>% rowSums()
+# train_prediction = train_prediction*CONSTANT # come l'ARIMA, i valori fitted so o le previsioni one-ahead
+val_prediction = kfs1$muhat[(length(train)+1):length(y)]*CONSTANT
+val_prediction %>% length()
+
+# mae_train = mean(abs(train - train_prediction))
+mae_val = mean(abs(val - val_prediction))
+
+k = 24*30
+
+tot_sum = kfs1$alphahat[1:k,mod$Z == 1] %>% rowSums() %>% as.numeric()
+plot(tot_sum, type='l', col = 'brown', ylim = c(min(tot_sum)-30, max(tot_sum)+100))
+lines(kfs1$alphahat[1:k,'level'] + kfs1$alphahat[1:k, 3], type='l', col = 'red')
+lines(kfs1$alphahat[1:k,'level'], type='l', col = 'green')
+lines(kfs1$alphahat[1:k,'level'] + kfs1$alphahat[1:k,3] + kfs1$alphahat[1:k, seq(2 + 23, 2 + 23 + 2*nh)] %>% rowSums(), type='l', col = 'blue')
+lines(y[1:k], col = 'black')
+# par(xpd = TRUE)
+legend("topleft", legend=c('LLT + Dummy[24] + Trig[24*7] + Trig[24*365]', "LLT + Dummy[24]", "LLT", 'LLt + Dummy[24] + Trig[24*7]'), col=c("red", "green", "blue"), lty = rep(1,3))
+
+
+# si osserva questo trend crescente: le varianze del trend sono troppo elevate.
+plot(as.numeric(val), type = 'l', col = 'black', ylim=c(min(val_prediction), max(val_prediction)))
+lines(val_prediction, col = "red")
+
+CODE = "Mod_2"
+result_UCM = rbind(result_UCM, c(CODE, mae_val))
+write.csv(result_UCM, 'result_UCM.csv')
+```
+
+
+
+```{r}
+
+# Aumento la varianza del trend.
+
+rm(fit1, kfs1, mod)
+
+nh = 8
+
+mod = SSModel(as.numeric(y) ~ (SSMtrend(2, list(NA, NA)) + 
+                SSMseasonal(24, NA, "dummy") + 
+                SSMseasonal(24*7, NA, "trig", harmonics = 1:nh) +
+                SSMseasonal(24*365, NA, "trig", harmonics = 1:nh)),
+              H = NA)
+
+mod$P1inf[] = 0
+diag(mod$P1) = vy
+mod$a1[1] = md
+
+updt = function(pars, model, nh) {
+  
+  model$Q[1, 1, 1] = exp(pars[1])
+  
+  model$Q[2, 2, 1] = exp(pars[2])
+  
+  model$Q[3, 3, 1] = exp(pars[3])
+  
+  diag(model$Q[4:(4 + 2*nh-1), 4:(4 + 2*nh-1), 1]) = exp(pars[4])
+  
+  diag(model$Q[(4 + 2*nh):(4 + 2*nh + 2*nh-1),
+               (4 + 2*nh):(4 + 2*nh + 2*nh-1), 1]) = exp(pars[5])
+  
+  model$H[1, 1, 1] = exp(pars[6])
+  
+  model
+}
+
+# con meno iterazioni ottengo un trend. 
+fit1 = fitSSM(mod, 
+              log(c(vy/10000, 
+                    vy/100000, 
+                    vy/100, 
+                    vy/10000, 
+                    vy/100000, 
+                    vy/10)),
+              updt,
+              update_args =  list(nh = nh),  control = list(maxit = 500)
+              )
+
+fit1$optim.out$convergence
+
+# Filtro di kalman.
+kfs1 <- KFS(fit1$model, smoothing = c("state", "signal", "disturbance"))
+
+kfs1$muhat %>% length()
+
+# train_prediction = kfs1$a[1:length(train),mod$Z == 1] %>% rowSums()
+# train_prediction = train_prediction*CONSTANT # come l'ARIMA, i valori fitted so o le previsioni one-ahead
+val_prediction = kfs1$muhat[(length(train)+1):length(y)]*CONSTANT
+val_prediction %>% length()
+
+# mae_train = mean(abs(train - train_prediction))
+mae_val = mean(abs(val - val_prediction))
+
+k = 24*30
+
+tot_sum = kfs1$alphahat[1:k,mod$Z == 1] %>% rowSums() %>% as.numeric()
+plot(tot_sum, type='l', col = 'brown', ylim = c(min(tot_sum)-30, max(tot_sum)+100))
+lines(kfs1$alphahat[1:k,'level'] + kfs1$alphahat[1:k, 3], type='l', col = 'red')
+lines(kfs1$alphahat[1:k,'level'], type='l', col = 'green')
+lines(kfs1$alphahat[1:k,'level'] + kfs1$alphahat[1:k,3] + kfs1$alphahat[1:k, seq(2 + 23, 2 + 23 + 2*nh)] %>% rowSums(), type='l', col = 'blue')
+lines(y[1:k], col = 'black')
+# par(xpd = TRUE)
+legend("topleft", legend=c('LLT + Dummy[24] + Trig[24*7] + Trig[24*365]', "LLT + Dummy[24]", "LLT", 'LLt + Dummy[24] + Trig[24*7]'), col=c("red", "green", "blue"), lty = rep(1,3))
+
+
+# si osserva questo trend crescente: le varianze del trend sono troppo elevate.
+plot(as.numeric(val), type = 'l', col = 'black', ylim=c(min(val_prediction), max(val_prediction)))
+lines(val_prediction, col = "red")
+
+CODE = "Mod_3"
+result_UCM = rbind(result_UCM, c(CODE, mae_val))
+write.csv(result_UCM, 'result_UCM.csv')
+```
+
+```{r}
+
+# Diminuisco la varianza iniziale di trend e level. 
+
+rm(fit1, kfs1, mod)
+
+nh = 8
+
+mod = SSModel(as.numeric(y) ~ (SSMtrend(2, list(NA, NA)) + 
+                SSMseasonal(24, NA, "dummy") + 
+                SSMseasonal(24*7, NA, "trig", harmonics = 1:nh) +
+                SSMseasonal(24*365, NA, "trig", harmonics = 1:nh)),
+              H = NA)
+# condizioni non diffuse: maggiore stabilità.
+mod$P1inf[] = 0
+diag(mod$P1) = vy
+mod$a1[1] = md
+
+updt = function(pars, model, nh) {
+  
+  model$Q[1, 1, 1] = exp(pars[1])
+  
+  model$Q[2, 2, 1] = exp(pars[2])
+  
+  model$Q[3, 3, 1] = exp(pars[3])
+  
+  diag(model$Q[4:(4 + 2*nh-1), 4:(4 + 2*nh-1), 1]) = exp(pars[4])
+  
+  diag(model$Q[(4 + 2*nh):(4 + 2*nh + 2*nh-1),
+               (4 + 2*nh):(4 + 2*nh + 2*nh-1), 1]) = exp(pars[5])
+  
+  model$H[1, 1, 1] = exp(pars[6])
+  
+  model
+}
+
+# con meno iterazioni ottengo un trend. 
+fit1 = fitSSM(mod, 
+              log(c(vy/10000000,   # level
+                    vy/10000000,   # slope
+                    vy/100,        # giornaliera dummy
+                    vy/10000,      # settimanale dummy 
+                    vy/100000,     # annuale dummy
+                    vy/10          # epsilon
+                    )
+                  ),
+              updt,
+              update_args =  list(nh = nh),  control = list(maxit = 500)
+              )
+
+
+fit1$optim.out$convergence
+
+# Filtro di Kalman per valutare le previsioni. 
+kfs1 <- KFS(fit1$model, 
+            filtering = c("state", "signal"), 
+            smoothing = c("state", "signal", "disturbance"))
+
+
+# Per il trainign utilizzo solo i dati passati come viene fatto nel modello ARIMA. 
+# train_prediction = kfs1$a[1:length(train),mod$Z == 1] %>% rowSums()
+# train_prediction = train_prediction*CONSTANT # come l'ARIMA, i valori fitted so o le previsioni one-ahead
+# train_prediction %>% length()
+# mae_train = mean(abs(train - train_prediction))
+
+val_prediction = kfs1$muhat[(length(train)+1):length(y)]*CONSTANT
+val_prediction %>% length()
+mae_val = mean(abs(val - val_prediction))
+
+k = 24*30
+tot_sum = kfs1$alphahat[1:k,mod$Z == 1] %>% rowSums() %>% as.numeric()
+plot(tot_sum, type='l', col = 'brown', ylim = c(min(tot_sum)-30, max(tot_sum)+100))
+lines(kfs1$alphahat[1:k,'level'] + kfs1$alphahat[1:k, 3], type='l', col = 'red')
+lines(kfs1$alphahat[1:k,'level'], type='l', col = 'green')
+lines(kfs1$alphahat[1:k,'level'] + kfs1$alphahat[1:k,3] + kfs1$alphahat[1:k, seq(2 + 23, 2 + 23 + 2*nh)] %>% rowSums(), type='l', col = 'blue')
+legend("topleft", legend=c('LLT + Dummy[24] + Trig[24*7] + Trig[24*365]', "LLT + Dummy[24]", "LLT", 'LLt + Dummy[24] + Trig[24*7]'), col=c("brown", "red", "green", "blue"), lty = rep(1,3))
+
+
+# plot(train_prediction[1:(24*10)], main = 'KFS$muhat for training and validation dataset. ', type = 'l')
+# lines(as.numeric(train)[1:(24*10)], col  = 'red')
+
+# si osserva questo trend crescente: le varianze del trend sono troppo elevate.
+plot(as.numeric(val), type = 'l', col = 'black', ylim=c(min(val_prediction), max(val_prediction)))
+lines(val_prediction, col = "red")
+
+CODE = "Mod_4"
+result_UCM = rbind(result_UCM, c(CODE, mae_val))
+write.csv(result_UCM, 'result_UCM.csv')
+```
+
+```{r}
+
+
+  
+# Diminuisco la varianza dle trend.
+
+rm(fit1, kfs1, mod)
+
+nh = 8
+
+mod = SSModel(as.numeric(y) ~ (SSMtrend(2, list(NA, NA)) + 
+                SSMseasonal(24, NA, "dummy") + 
+                SSMseasonal(24*7, NA, "trig", harmonics = 1:nh) +
+                SSMseasonal(24*365, NA, "trig", harmonics = 1:nh)),
+              H = NA)
+# condizioni non diffuse: maggiore stabilità.
+mod$P1inf[] = 0
+diag(mod$P1) = vy
+mod$a1[1] = md
+
+updt = function(pars, model, nh) {
+  
+  model$Q[1, 1, 1] = exp(pars[1])
+  
+  model$Q[2, 2, 1] = exp(pars[2])
+  
+  model$Q[3, 3, 1] = exp(pars[3])
+  
+  diag(model$Q[4:(4 + 2*nh-1), 4:(4 + 2*nh-1), 1]) = exp(pars[4])
+  
+  diag(model$Q[(4 + 2*nh):(4 + 2*nh + 2*nh-1),
+               (4 + 2*nh):(4 + 2*nh + 2*nh-1), 1]) = exp(pars[5])
+  
+  model$H[1, 1, 1] = exp(pars[6])
+  
+  model
+}
+
+# con meno iterazioni ottengo un trend. 
+fit1 = fitSSM(mod, 
+              log(c(vy/1000000000,   # level
+                    vy/1000000000,   # slope
+                    vy/100,        # giornaliera dummy
+                    vy/10000,      # settimanale dummy 
+                    vy/100000,     # annuale dummy
+                    vy/10          # epsilon
+                    )
+                  ),
+              updt,
+              update_args =  list(nh = nh),  control = list(maxit = 500)
+              )
+
+fit1$optim.out$convergence
+
+# Filtro di Kalman per valutare le previsioni. 
+kfs1 <- KFS(fit1$model, 
+            filtering = c("state", "signal"), 
+            smoothing = c("state", "signal", "disturbance"))
+
+
+# Per il trainign utilizzo solo i dati passati come viene fatto nel modello ARIMA. 
+# train_prediction = kfs1$a[1:length(train),mod$Z == 1] %>% rowSums()
+# train_prediction = train_prediction*CONSTANT # come l'ARIMA, i valori fitted so o le previsioni one-ahead
+# train_prediction %>% length()
+# mae_train = mean(abs(train - train_prediction))
+
+val_prediction = kfs1$muhat[(length(train)+1):length(y)]*CONSTANT
+val_prediction %>% length()
+mae_val = mean(abs(val - val_prediction))
+
+k = 24*30
+tot_sum = kfs1$alphahat[1:k,mod$Z == 1] %>% rowSums() %>% as.numeric()
+plot(tot_sum, type='l', col = 'brown', ylim = c(min(tot_sum)-30, max(tot_sum)+100))
+lines(kfs1$alphahat[1:k,'level'] + kfs1$alphahat[1:k, 3], type='l', col = 'red')
+lines(kfs1$alphahat[1:k,'level'], type='l', col = 'green')
+lines(kfs1$alphahat[1:k,'level'] + kfs1$alphahat[1:k,3] + kfs1$alphahat[1:k, seq(2 + 23, 2 + 23 + 2*nh)] %>% rowSums(), type='l', col = 'blue')
+legend("topleft", legend=c('LLT + Dummy[24] + Trig[24*7] + Trig[24*365]', "LLT + Dummy[24]", "LLT", 'LLt + Dummy[24] + Trig[24*7]'), col=c("brown", "red", "green", "blue"), lty = rep(1,3))
+
+
+# plot(train_prediction[1:(24*10)], main = 'KFS$muhat for training and validation dataset. ', type = 'l')
+# lines(as.numeric(train)[1:(24*10)], col  = 'red')
+
+# si osserva questo trend crescente: le varianze del trend sono troppo elevate.
+plot(as.numeric(val), type = 'l', col = 'black', ylim=c(min(val_prediction), max(val_prediction)))
+lines(val_prediction, col = "red")
+
+CODE = "Mod_5"
+result_UCM = rbind(result_UCM, c(CODE, mae_val))
+write.csv(result_UCM, 'result_UCM.csv')
+
+```
+
+```{r}
+
+# Modifichiamo il numero delle sinusoidi. 
+
+rm(fit1, kfs1, mod)
+
+nh_annual = 16
+nh_week = 8
+
+mod = SSModel(as.numeric(y) ~ (SSMtrend(2, list(NA, NA)) + 
+                SSMseasonal(24, NA, "dummy") + 
+                SSMseasonal(24*7, NA, "trig", harmonics = 1:nh_week) +
+                SSMseasonal(24*365, NA, "trig", harmonics = 1:nh_annual)),
+              H = NA)
+# condizioni iniziali non diffuse.
+mod$P1inf[] = 0
+diag(mod$P1) = vy
+mod$a1[1] = md
+
+updt = function(pars, model, nh_annual, nh_week) {
+  
+  model$Q[1, 1, 1] = exp(pars[1])
+  
+  model$Q[2, 2, 1] = exp(pars[2])
+  
+  model$Q[3, 3, 1] = exp(pars[3])
+  
+  diag(model$Q[4:(4 + 2*nh_week-1), 4:(4 + 2*nh_week-1), 1]) = exp(pars[4])
+  
+  diag(model$Q[(4 + 2*nh_week):(4 + 2*nh_week + 2*nh_annual-1),
+               (4 + 2*nh_week):(4 + 2*nh_week + 2*nh_annual-1), 1]) = exp(pars[5])
+  
+  model$H[1, 1, 1] = exp(pars[6])
+  
+  model
+}
+
+# con meno iterazioni ottengo un trend. 
+fit1 = fitSSM(mod, 
+              log(c(vy/1000000000,   # level
+                    vy/1000000000,   # slope
+                    vy/100,        # giornaliera dummy
+                    vy/10000,      # settimanale trig 
+                    vy/100000,     # annuale trig
+                    vy/10          # epsilon
+                    )
+                  ),
+              updt,
+              update_args =  list(nh_annual = nh_annual, nh_week = nh_week),  control = list(maxit = 500)
+              )
+
+fit1$optim.out$convergence
+
+
+# Filtro di Kalman per valutare le previsioni. 
+kfs1 <- KFS(fit1$model, 
+            smoothing = c("state", "signal", "disturbance"))
+
+
+# train_prediction = kfs1$a[1:length(train)]*CONSTANT # come l'ARIMA, i valori fitted so o le previsioni one-ahead
+# train_prediction %>% length()
+# mae_train = mean(abs(train - train_prediction))
+
+val_prediction = kfs1$muhat[(length(train)+1):length(y)]*CONSTANT
+val_prediction %>% length()
+mae_val = mean(abs(val - val_prediction))
+
+k = 24*30
+tot_sum = kfs1$alphahat[1:k,mod$Z == 1] %>% rowSums() %>% as.numeric()
+
+plot(tot_sum, type='l', col = 'brown', ylim = c(min(tot_sum)-30, max(tot_sum)+100))
+
+lines(kfs1$alphahat[1:k,'level'] + kfs1$alphahat[1:k, 3], type='l', col = 'red')
+
+lines(kfs1$alphahat[1:k,'level'], type='l', col = 'green')
+
+lines(kfs1$alphahat[1:k,'level'] + kfs1$alphahat[1:k,3] + kfs1$alphahat[1:k, seq(2 + 23, 2 + 23 + 2*nh_week)] %>% rowSums(), type='l', col = 'blue')
+legend("topleft", legend=c('LLT + Dummy[24] + Trig[24*7] + Trig[24*365]', 
+                           "LLT + Dummy[24]", 
+                           "LLT", 
+                           'LLT + Dummy[24] + Trig[24*7]'),
+       col=c("brown", "red", "green", "blue"), lty = rep(1,3))
+
+
+
+# si osserva questo trend crescente: le varianze del trend sono troppo elevate.
+plot(as.numeric(val), type = 'l', col = 'black', ylim=c(min(val_prediction), max(val_prediction)))
+lines(val_prediction, col = "red")
+
+CODE = "Mod_6"
+result_UCM = rbind(result_UCM, c(CODE, mae_val))
+write.csv(result_UCM, 'result_UCM.csv')
+```
+
+
+
+```{r}
+
+# Modifichiamo il numero delle sinusoidi. 
+
+rm(fit1, kfs1, mod)
+
+nh_annual = 16
+nh_week = 8
+
+mod = SSModel(as.numeric(y) ~ (SSMtrend(2, list(NA, NA)) + 
+                SSMseasonal(24, NA, "dummy") + 
+                SSMseasonal(24*7, NA, "trig", harmonics = 1:nh_week) +
+                SSMseasonal(24*365, NA, "trig", harmonics = 1:nh_annual)),
+              H = NA)
+# condizioni iniziali non diffuse.
+mod$P1inf[] = 0
+diag(mod$P1) = vy
+mod$a1[1] = md
+
+updt = function(pars, model, nh_annual, nh_week) {
+  
+  model$Q[1, 1, 1] = exp(pars[1])
+  
+  model$Q[2, 2, 1] = exp(pars[2])
+  
+  model$Q[3, 3, 1] = exp(pars[3])
+  
+  diag(model$Q[4:(4 + 2*nh_week-1), 4:(4 + 2*nh_week-1), 1]) = exp(pars[4])
+  
+  diag(model$Q[(4 + 2*nh_week):(4 + 2*nh_week + 2*nh_annual-1),
+               (4 + 2*nh_week):(4 + 2*nh_week + 2*nh_annual-1), 1]) = exp(pars[5])
+  
+  model$H[1, 1, 1] = exp(pars[6])
+  
+  model
+}
+
+# con meno iterazioni ottengo un trend. 
+fit1 = fitSSM(mod, 
+              log(c(vy/1000000000,   # level
+                    vy/1000000000,   # slope
+                    vy/1000,        # giornaliera dummy
+                    vy/10000,      # settimanale trig 
+                    vy/100000,     # annuale trig
+                    vy/10          # epsilon
+                    )
+                  ),
+              updt,
+              update_args =  list(nh_annual = nh_annual, nh_week = nh_week),  control = list(maxit = 500)
+              )
+
+fit1$optim.out$convergence
+
+rm(kfs1)
+# Filtro di Kalman per valutare le previsioni. 
+kfs1 <- KFS(fit1$model, 
+            smoothing = c("state", "signal", "disturbance"))
+
+
+# train_prediction = kfs1$a[1:length(train)]*CONSTANT # come l'ARIMA, i valori fitted so o le previsioni one-ahead
+# train_prediction %>% length()
+# mae_train = mean(abs(train - train_prediction))
+
+val_prediction = kfs1$muhat[(length(train)+1):length(y)]*CONSTANT
+val_prediction %>% length()
+mae_val = mean(abs(val - val_prediction))
+
+k = 24*30
+tot_sum = kfs1$alphahat[1:k,mod$Z == 1] %>% rowSums() %>% as.numeric()
+
+plot(tot_sum, type='l', col = 'brown', ylim = c(min(tot_sum)-30, max(tot_sum)+100))
+
+lines(kfs1$alphahat[1:k,'level'] + kfs1$alphahat[1:k, 3], type='l', col = 'red')
+
+lines(kfs1$alphahat[1:k,'level'], type='l', col = 'green')
+
+lines(kfs1$alphahat[1:k,'level'] + kfs1$alphahat[1:k,3] + kfs1$alphahat[1:k, seq(2 + 23, 2 + 23 + 2*nh_week)] %>% rowSums(), type='l', col = 'blue')
+legend("topleft", legend=c('LLT + Dummy[24] + Trig[24*7] + Trig[24*365]', 
+                           "LLT + Dummy[24]", 
+                           "LLT", 
+                           'LLT + Dummy[24] + Trig[24*7]'),
+       col=c("brown", "red", "green", "blue"), lty = rep(1,3))
+
+
+
+# si osserva questo trend crescente: le varianze del trend sono troppo elevate.
+plot(as.numeric(val), type = 'l', col = 'black', ylim=c(min(val_prediction), max(val_prediction)))
+lines(val_prediction, col = "red")
+
+CODE = "Mod_7"
+result_UCM = rbind(result_UCM, c(CODE, mae_val))
+write.csv(result_UCM, 'result_UCM.csv')
+
+```
+
+```{r}
+
+# Diminuisco la stagioalità settimanale. 
+
+rm(fit1, kfs1, mod)
+
+nh_annual = 16
+nh_week = 8
+
+mod = SSModel(as.numeric(y) ~ (SSMtrend(2, list(NA, NA)) + 
+                SSMseasonal(24, NA, "dummy") + 
+                SSMseasonal(24*7, NA, "trig", harmonics = 1:nh_week) +
+                SSMseasonal(24*365, NA, "trig", harmonics = 1:nh_annual)),
+              H = NA)
+# condizioni iniziali non diffuse.
+mod$P1inf[] = 0
+diag(mod$P1) = vy
+mod$a1[1] = md
+
+updt = function(pars, model, nh_annual, nh_week) {
+  
+  model$Q[1, 1, 1] = exp(pars[1])
+  
+  model$Q[2, 2, 1] = exp(pars[2])
+  
+  model$Q[3, 3, 1] = exp(pars[3])
+  
+  diag(model$Q[4:(4 + 2*nh_week-1), 4:(4 + 2*nh_week-1), 1]) = exp(pars[4])
+  
+  diag(model$Q[(4 + 2*nh_week):(4 + 2*nh_week + 2*nh_annual-1),
+               (4 + 2*nh_week):(4 + 2*nh_week + 2*nh_annual-1), 1]) = exp(pars[5])
+  
+  model$H[1, 1, 1] = exp(pars[6])
+  
+  model
+}
+
+# con meno iterazioni ottengo un trend. 
+fit1 = fitSSM(mod, 
+              log(c(vy/1000000000,   # level
+                    vy/1000000000,   # slope
+                    vy/1000,        # giornaliera dummy
+                    vy/10000,      # settimanale trig 
+                    vy/150000,     # annuale trig
+                    vy/10          # epsilon
+                    )
+                  ),
+              updt,
+              update_args =  list(nh_annual = nh_annual, nh_week = nh_week),  control = list(maxit = 500)
+              )
+
+fit1$optim.out$convergence
+
+rm(kfs1)
+# Filtro di Kalman per valutare le previsioni. 
+kfs1 <- KFS(fit1$model, 
+            smoothing = c("state", "signal", "disturbance"))
+
+
+# train_prediction = kfs1$a[1:length(train)]*CONSTANT # come l'ARIMA, i valori fitted so o le previsioni one-ahead
+# train_prediction %>% length()
+# mae_train = mean(abs(train - train_prediction))
+
+val_prediction = kfs1$muhat[(length(train)+1):length(y)]*CONSTANT
+val_prediction %>% length()
+mae_val = mean(abs(val - val_prediction))
+
+k = 24*30
+tot_sum = kfs1$alphahat[1:k,mod$Z == 1] %>% rowSums() %>% as.numeric()
+
+plot(tot_sum, type='l', col = 'brown', ylim = c(min(tot_sum)-30, max(tot_sum)+100))
+
+lines(kfs1$alphahat[1:k,'level'] + kfs1$alphahat[1:k, 3], type='l', col = 'red')
+
+lines(kfs1$alphahat[1:k,'level'], type='l', col = 'green')
+
+lines(kfs1$alphahat[1:k,'level'] + kfs1$alphahat[1:k,3] + kfs1$alphahat[1:k, seq(2 + 23, 2 + 23 + 2*nh_week)] %>% rowSums(), type='l', col = 'blue')
+legend("topleft", legend=c('LLT + Dummy[24] + Trig[24*7] + Trig[24*365]', 
+                           "LLT + Dummy[24]", 
+                           "LLT", 
+                           'LLT + Dummy[24] + Trig[24*7]'),
+       col=c("brown", "red", "green", "blue"), lty = rep(1,3))
+
+# previsione vs. validation.
+plot(as.numeric(val), type = 'l', col = 'black', ylim=c(min(val_prediction), max(val_prediction)))
+lines(val_prediction, col = "red")
+
+CODE = "Mod_8"
+result_UCM = rbind(result_UCM, c(CODE, mae_val))
+write.csv(result_UCM, 'result_UCM.csv')
+
+```
+
+
+```{r}
+# Modifichiamo il numero delle sinusoidi. 
+
+rm(fit1, kfs1, mod)
+
+nh_annual = 8
+nh_week = 8
+
+mod = SSModel(as.numeric(y) ~ (SSMtrend(2, list(NA, NA)) + 
+                SSMseasonal(24, NA, "dummy") + 
+                SSMseasonal(24*7, NA, "trig", harmonics = 1:nh_week) +
+                SSMseasonal(24*365, NA, "trig", harmonics = 1:nh_annual)),
+              H = NA)
+# condizioni iniziali non diffuse.
+mod$P1inf[] = 0
+diag(mod$P1) = vy
+mod$a1[1] = md
+
+updt = function(pars, model, nh_annual, nh_week) {
+  
+  model$Q[1, 1, 1] = exp(pars[1])
+  
+  model$Q[2, 2, 1] = exp(pars[2])
+  
+  model$Q[3, 3, 1] = exp(pars[3])
+  
+  diag(model$Q[4:(4 + 2*nh_week-1), 4:(4 + 2*nh_week-1), 1]) = exp(pars[4])
+  
+  diag(model$Q[(4 + 2*nh_week):(4 + 2*nh_week + 2*nh_annual-1),
+               (4 + 2*nh_week):(4 + 2*nh_week + 2*nh_annual-1), 1]) = exp(pars[5])
+  
+  model$H[1, 1, 1] = exp(pars[6])
+  
+  model
+}
+
+# con meno iterazioni ottengo un trend. 
+fit1 = fitSSM(mod, 
+              log(c(vy/1000000000,   # level
+                    vy/1000000000,   # slope
+                    vy/1000,        # giornaliera dummy
+                    vy/10000,      # settimanale trig 
+                    vy/100000,     # annuale trig
+                    vy/10          # epsilon
+                    )
+                  ),
+              updt,
+              update_args =  list(nh_annual = nh_annual, nh_week = nh_week),  control = list(maxit = 500)
+              )
+
+fit1$optim.out$convergence
+
+rm(kfs1)
+# Filtro di Kalman per valutare le previsioni. 
+kfs1 <- KFS(fit1$model, 
+            smoothing = c("state", "signal", "disturbance"))
+
+
+# train_prediction = kfs1$a[1:length(train)]*CONSTANT # come l'ARIMA, i valori fitted so o le previsioni one-ahead
+# train_prediction %>% length()
+# mae_train = mean(abs(train - train_prediction))
+
+val_prediction = kfs1$muhat[(length(train)+1):length(y)]*CONSTANT
+val_prediction %>% length()
+mae_val = mean(abs(val - val_prediction))
+
+k = 24*30
+tot_sum = kfs1$alphahat[1:k,mod$Z == 1] %>% rowSums() %>% as.numeric()
+
+plot(tot_sum, type='l', col = 'brown', ylim = c(min(tot_sum)-30, max(tot_sum)+100))
+
+lines(kfs1$alphahat[1:k,'level'] + kfs1$alphahat[1:k, 3], type='l', col = 'red')
+
+lines(kfs1$alphahat[1:k,'level'], type='l', col = 'green')
+
+lines(kfs1$alphahat[1:k,'level'] + kfs1$alphahat[1:k,3] + kfs1$alphahat[1:k, seq(2 + 23, 2 + 23 + 2*nh_week)] %>% rowSums(), type='l', col = 'blue')
+legend("topleft", legend=c('LLT + Dummy[24] + Trig[24*7] + Trig[24*365]', 
+                           "LLT + Dummy[24]", 
+                           "LLT", 
+                           'LLT + Dummy[24] + Trig[24*7]'),
+       col=c("brown", "red", "green", "blue"), lty = rep(1,3))
+
+
+# previsione vs. validation.
+plot(as.numeric(val), type = 'l', col = 'black', ylim=c(min(val_prediction), max(val_prediction)))
+lines(val_prediction, col = "red")
+
+CODE = "Mod_9"
+result_UCM = rbind(result_UCM, c(CODE, mae_val))
+write.csv(result_UCM, 'result_UCM.csv')
+```
+
+
+
+```{r}
+
+# Modello di prova.
+
+rm(fit1, kfs1, mod)
+
+nh_annual = 16
+nh_week = 8
+
+mod = SSModel(as.numeric(y) ~ (SSMtrend(2, list(NA, 0)) + 
+                SSMseasonal(24, NA, "dummy") + 
+                SSMseasonal(24*7, NA, "trig", harmonics = 1:nh_week) +
+                SSMseasonal(24*365, NA, "trig", harmonics = 1:nh_annual)),
+              H = NA)
+# condizioni iniziali non diffuse.
+mod$P1inf[] = 0
+diag(mod$P1) = vy
+mod$a1[1] = md
+
+updt <- function(pars, model, nh7, nh365) {
+  model$Q[1, 1, 1] <- exp(pars[1])
+#   model$Q[2, 2, 1] <- exp(pars[2])
+  model$Q[3, 3, 1] <- exp(pars[2])
+  diag(model$Q[4:(4 + 2*nh7-1), 4:(4 + 2*nh7-1), 1]) <- exp(pars[3])
+  diag(model$Q[(4 + 2*nh7):(4 + 2*nh7 + 2*nh365-1),
+               (4 + 2*nh7):(4 + 2*nh7 + 2*nh365-1), 1]) <- exp(pars[4])
+  model$H[1, 1, 1] <- exp(pars[5])
+  model
+}
+
+# con meno iterazioni ottengo un trend. 
+fit1 = fitSSM(mod, 
+              log(c(vy/300, vy/1000, vy/10000, vy/10000,vy/10)),
+              updt,
+              update_args =  list(nh365 = nh_annual, nh7 = nh_week)
+              )
+
+fit1$optim.out$convergence
+
+rm(kfs1)
+# Filtro di Kalman per valutare le previsioni. 
+kfs1 <- KFS(fit1$model, 
+            smoothing = c("state", "signal", "disturbance"))
+
+
+# train_prediction = kfs1$a[1:length(train)]*CONSTANT # come l'ARIMA, i valori fitted so o le previsioni one-ahead
+# train_prediction %>% length()
+# mae_train = mean(abs(train - train_prediction))
+
+val_prediction = kfs1$muhat[(length(train)+1):length(y)]*CONSTANT
+val_prediction %>% length()
+mae_val = mean(abs(val - val_prediction))
+
+# previsione vs. validation.
+plot(as.numeric(val), type = 'l', col = 'black', ylim=c(min(val_prediction), max(val_prediction)))
+lines(val_prediction, col = "red")
+
+CODE = "Mod_10"
+result_UCM = rbind(result_UCM, c(CODE, mae_val))
+write.csv(result_UCM, 'result_UCM.csv')
+
+
+```
+
+
+
+```{r}
+
+# Diminuisco la stagionalità giornaliera.
+
+rm(fit1, kfs1, mod)
+
+nh_annual = 16
+nh_week = 8
+
+rm(mod, fit1, kfs1, val_prediction)
+mod = SSModel(as.numeric(y) ~ (SSMtrend(2, list(NA, NA)) + 
+                SSMseasonal(24, NA, "dummy") + 
+                SSMseasonal(24*7, NA, "trig", harmonics = 1:nh_week) +
+                SSMseasonal(24*365, NA, "trig", harmonics = 1:nh_annual)),
+              H = NA)
+# condizioni iniziali non diffuse.
+mod$P1inf[] = 0
+diag(mod$P1) = vy
+mod$a1[1] = md
+
+updt = function(pars, model, nh_annual, nh_week) {
+  
+  model$Q[1, 1, 1] = exp(pars[1])
+  
+  model$Q[2, 2, 1] = exp(pars[2])
+  
+  model$Q[3, 3, 1] = exp(pars[3])
+  
+  diag(model$Q[4:(4 + 2*nh_week-1), 4:(4 + 2*nh_week-1), 1]) = exp(pars[4])
+  
+  diag(model$Q[(4 + 2*nh_week):(4 + 2*nh_week + 2*nh_annual-1),
+               (4 + 2*nh_week):(4 + 2*nh_week + 2*nh_annual-1), 1]) = exp(pars[5])
+  
+  model$H[1, 1, 1] = exp(pars[6])
+  
+  model
+}
+
+# con meno iterazioni ottengo un trend. 
+# con meno iterazioni ottengo un trend. 
+fit1 = fitSSM(mod, 
+              log(c(vy/1000000000,   # level
+                    vy/1000000000,   # slope
+                    vy/10000,        # giornaliera dummy
+                    vy/10000,      # settimanale trig 
+                    vy/100000,     # annuale trig
+                    vy/10          # epsilon
+                    )
+                  ),
+              updt,
+              update_args =  list(nh_annual = nh_annual, nh_week = nh_week),  control = list(maxit = 500)
+              )
+
+fit1$optim.out$convergence
+
+# Filtro di Kalman per valutare le previsioni. 
+kfs1 <- KFS(fit1$model, 
+            smoothing = c("state", "signal", "disturbance"))
+
+
+# train_prediction = kfs1$a[1:length(train)]*CONSTANT # come l'ARIMA, i valori fitted so o le previsioni one-ahead
+# train_prediction %>% length()
+# mae_train = mean(abs(train - train_prediction))
+
+val_prediction = kfs1$muhat[(length(train)+1):length(y)]*CONSTANT
+val_prediction %>% length()
+mae_val = mean(abs(val - val_prediction))
+
+k = 24*30
+tot_sum = kfs1$alphahat[1:k,mod$Z == 1] %>% rowSums() %>% as.numeric()
+
+plot(tot_sum, type='l', col = 'brown', ylim = c(min(tot_sum)-30, max(tot_sum)+100))
+
+lines(kfs1$alphahat[1:k,'level'] + kfs1$alphahat[1:k, 3], type='l', col = 'red')
+
+lines(kfs1$alphahat[1:k,'level'], type='l', col = 'green')
+
+lines(kfs1$alphahat[1:k,'level'] + kfs1$alphahat[1:k,3] + kfs1$alphahat[1:k, seq(2 + 23, 2 + 23 + 2*nh_week)] %>% rowSums(), type='l', col = 'blue')
+legend("topleft", legend=c('LLT + Dummy[24] + Trig[24*7] + Trig[24*365]', 
+                           "LLT + Dummy[24]", 
+                           "LLT", 
+                           'LLT + Dummy[24] + Trig[24*7]'),
+       col=c("brown", "red", "green", "blue"), lty = rep(1,3))
+
+
+
+# previsione vs. validation.
+plot(as.numeric(val), type = 'l', col = 'black', ylim=c(min(val_prediction), max(val_prediction)))
+lines(val_prediction, col = "red")
+
+CODE = "Mod_11"
+result_UCM = rbind(result_UCM, c(CODE, mae_val))
+write.csv(result_UCM, 'result_UCM.csv')
+```
+
+```{r}
+
+# Diminuisco la stagionalità gironaliera.
+
+rm(fit1, kfs1, mod)
+
+nh_annual = 16
+nh_week = 8
+
+rm(data, df, reg_y_8, reg_y_32)
+mod1 = SSModel(as.numeric(y) ~ (SSMtrend(2, list(NA, NA)) + 
+                SSMseasonal(24, NA, "dummy") + 
+                SSMseasonal(24*7, NA, "trig", harmonics = 1:nh_week) +
+                SSMseasonal(24*365, NA, "trig", harmonics = 1:nh_annual)),
+              H = NA)
+# condizioni iniziali non diffuse.
+mod$P1inf[] = 0
+diag(mod$P1) = vy
+mod$a1[1] = md
+
+updt = function(pars, model, nh_annual, nh_week) {
+  
+  model$Q[1, 1, 1] = exp(pars[1])
+  
+  model$Q[2, 2, 1] = exp(pars[2])
+  
+  model$Q[3, 3, 1] = exp(pars[3])
+  
+  diag(model$Q[4:(4 + 2*nh_week-1), 4:(4 + 2*nh_week-1), 1]) = exp(pars[4])
+  
+  diag(model$Q[(4 + 2*nh_week):(4 + 2*nh_week + 2*nh_annual-1),
+               (4 + 2*nh_week):(4 + 2*nh_week + 2*nh_annual-1), 1]) = exp(pars[5])
+  
+  model$H[1, 1, 1] = exp(pars[6])
+  
+  model
+}
+
+# con meno iterazioni ottengo un trend. 
+
+fit1 = fitSSM(mod, 
+              log(c(vy/10000000000,   # level
+                    vy/10000000000,   # slope
+                    vy/100000,        # giornaliera dummy con vy/10000 ho un trend, anche con vy/100000
+                    vy/10000,      # settimanale trig 
+                    vy/1000000,     # annuale trig
+                    vy/10          # epsilon
+                    )
+                  ),
+              updt,
+              update_args =  list(nh_annual = nh_annual, nh_week = nh_week),  control = list(maxit = 500)
+              )
+
+fit1$optim.out$convergence
+
+
+# Filtro di Kalman per valutare le previsioni. 
+kfs1 <- KFS(fit1$model, 
+            smoothing = c("state", "signal", "disturbance"))
+
+
+train_prediction = (kfs1$a[1:length(train), mod1$Z == 1] %>% rowSums() %>% as.numeric())*CONSTANT # come l'ARIMA, i valori fitted so o le previsioni one-ahead
+train_prediction %>% length()
+mae_train = mean(abs(train - train_prediction))
+
+val_prediction = kfs1$muhat[(length(train)+1):length(y)]*CONSTANT
+val_prediction %>% length()
+mae_val = mean(abs(val - val_prediction))
+
+k = 24*30
+tot_sum = kfs1$alphahat[1:k,mod$Z == 1] %>% rowSums() %>% as.numeric()
+
+plot(tot_sum, type='l', col = 'brown', ylim = c(min(tot_sum)-30, max(tot_sum)+100))
+
+lines(kfs1$alphahat[1:k,'level'] + kfs1$alphahat[1:k, 3], type='l', col = 'red')
+
+lines(kfs1$alphahat[1:k,'level'], type='l', col = 'green')
+
+lines(kfs1$alphahat[1:k,'level'] + kfs1$alphahat[1:k,3] + kfs1$alphahat[1:k, seq(2 + 23, 2 + 23 + 2*nh_week)] %>% rowSums(), type='l', col = 'blue')
+legend("topleft", legend=c('LLT + Dummy[24] + Trig[24*7] + Trig[24*365]', 
+                           "LLT + Dummy[24]", 
+                           "LLT", 
+                           'LLT + Dummy[24] + Trig[24*7]'),
+       col=c("brown", "red", "green", "blue"), lty = rep(1,3))
+
+
+
+# si osserva questo trend crescente: le varianze del trend sono troppo elevate.
+cat('mae_val', mae_val)
+cat('mae_train', mae_train)
+
+plot(as.numeric(val), type = 'l', col = 'black', ylim=c(min(val_prediction), max(val_prediction)), xlab = 'Index', ylab = 'Value')
+lines(val_prediction, col = "red")
+legend(1,7e6, legend=c("Validation data", "UCM predictions"),
+       col=c("black", "red"), lty=c(1,1))
+
+CODE = "Mod_12"
+result_UCM = rbind(result_UCM, c(CODE, mae_val))
+write.csv(result_UCM, 'result_UCM.csv')
+
+df_eval = read.csv('df_eval.csv')
+df_eval = rbind(df_eval, evaluation(val, val_prediction, "UCM"))
+write.csv(df_eval, "df_eval.csv")
+
+```
+
+
+```{r}
+
+# Diminuisco la varianza iniziale per la stagionalità settimanale- 
+
+rm(fit1, kfs1, mod)
+
+nh_annual = 16
+nh_week = 8
+
+rm(fit1, kfs1, mod)
+mod = SSModel(as.numeric(y) ~ (SSMtrend(2, list(NA, NA)) + 
+                SSMseasonal(24, NA, "dummy") + 
+                SSMseasonal(24*7, NA, "trig", harmonics = 1:nh_week) +
+                SSMseasonal(24*365, NA, "trig", harmonics = 1:nh_annual)),
+              H = NA)
+# condizioni iniziali non diffuse.
+mod$P1inf[] = 0
+diag(mod$P1) = vy
+mod$a1[1] = md
+
+updt = function(pars, model, nh_annual, nh_week) {
+  
+  model$Q[1, 1, 1] = exp(pars[1])
+  
+  model$Q[2, 2, 1] = exp(pars[2])
+  
+  model$Q[3, 3, 1] = exp(pars[3])
+  
+  diag(model$Q[4:(4 + 2*nh_week-1), 4:(4 + 2*nh_week-1), 1]) = exp(pars[4])
+  
+  diag(model$Q[(4 + 2*nh_week):(4 + 2*nh_week + 2*nh_annual-1),
+               (4 + 2*nh_week):(4 + 2*nh_week + 2*nh_annual-1), 1]) = exp(pars[5])
+  
+  model$H[1, 1, 1] = exp(pars[6])
+  
+  model
+}
+
+# con meno iterazioni ottengo un trend. 
+
+fit1 = fitSSM(mod, 
+              log(c(vy/10000000000,   # level
+                    vy/10000000000,   # slope
+                    vy/100000,        # giornaliera dummy con vy/10000 ho un trend, anche con vy/100000
+                    vy/100000,      # settimanale trig 
+                    vy/1000000,     # annuale trig
+                    vy/10          # epsilon
+                    )
+                  ),
+              updt,
+              update_args =  list(nh_annual = nh_annual, nh_week = nh_week),  control = list(maxit = 500)
+              )
+
+fit1$optim.out$convergence
+
+
+# Filtro di Kalman per valutare le previsioni. 
+kfs1 <- KFS(fit1$model, 
+            smoothing = c("state", "signal", "disturbance"))
+
+
+# train_prediction = kfs1$a[1:length(train)]*CONSTANT # come l'ARIMA, i valori fitted so o le previsioni one-ahead
+# train_prediction %>% length()
+# mae_train = mean(abs(train - train_prediction))
+
+val_prediction = kfs1$muhat[(length(train)+1):length(y)]*CONSTANT
+val_prediction %>% length()
+mae_val = mean(abs(val - val_prediction))
+
+k = 24*30
+tot_sum = kfs1$alphahat[1:k,mod$Z == 1] %>% rowSums() %>% as.numeric()
+
+plot(tot_sum, type='l', col = 'brown', ylim = c(min(tot_sum)-30, max(tot_sum)+100))
+
+lines(kfs1$alphahat[1:k,'level'] + kfs1$alphahat[1:k, 3], type='l', col = 'red')
+
+lines(kfs1$alphahat[1:k,'level'], type='l', col = 'green')
+
+lines(kfs1$alphahat[1:k,'level'] + kfs1$alphahat[1:k,3] + kfs1$alphahat[1:k, seq(2 + 23, 2 + 23 + 2*nh_week)] %>% rowSums(), type='l', col = 'blue')
+legend("topleft", legend=c('LLT + Dummy[24] + Trig[24*7] + Trig[24*365]', 
+                           "LLT + Dummy[24]", 
+                           "LLT", 
+                           'LLT + Dummy[24] + Trig[24*7]'),
+       col=c("brown", "red", "green", "blue"), lty = rep(1,3))
+
+
+
+# si osserva questo trend crescente: le varianze del trend sono troppo elevate.
+plot(as.numeric(val), type = 'l', col = 'black', ylim=c(min(val_prediction), max(val_prediction)))
+lines(val_prediction, col = "red")
+
+CODE = "Mod_13"
+result_UCM = rbind(result_UCM, c(CODE, mae_val))
+write.csv(result_UCM, 'result_UCM.csv')
+```
+
+
+
+```{r}
+result_UCM %>% arrange(as.numeric(MAE))
+```
+
+
+```{r}
+
+# prendo il modello migliore ed aggiungo i regressori esterni che sono significativi per l'ARIMA. 
+
+
+rm(fit1, kfs1, mod)
+
+nh_annual = 16
+nh_week = 8
+
+rm(fit1, kfs1, mod)
+mod = SSModel(as.numeric(y) ~ Covid + Nov1 + Mag1 +
+                (SSMtrend(2, list(NA, NA)) + 
+                SSMseasonal(24, NA, "dummy") + 
+                SSMseasonal(24*7, NA, "trig", harmonics = 1:nh_week) +
+                SSMseasonal(24*365, NA, "trig", harmonics = 1:nh_annual)),
+              data = rbind(train_feste_dummy, val_feste_dummy),
+              H = NA)
+# condizioni iniziali non diffuse.
+mod$P1inf[] = 0
+diag(mod$P1) = vy
+mod$a1[1] = md
+
+updt = function(pars, model, nh_annual, nh_week) {
+  
+  model$Q[1, 1, 1] = exp(pars[1])
+  
+  model$Q[2, 2, 1] = exp(pars[2])
+  
+  model$Q[3, 3, 1] = exp(pars[3])
+  
+  diag(model$Q[4:(4 + 2*nh_week-1), 4:(4 + 2*nh_week-1), 1]) = exp(pars[4])
+  
+  diag(model$Q[(4 + 2*nh_week):(4 + 2*nh_week + 2*nh_annual-1),
+               (4 + 2*nh_week):(4 + 2*nh_week + 2*nh_annual-1), 1]) = exp(pars[5])
+  
+  model$H[1, 1, 1] = exp(pars[6])
+  
+  model
+}
+
+# con meno iterazioni ottengo un trend. 
+
+fit1 = fitSSM(mod, 
+              log(c(vy/10000000000,   # level
+                    vy/10000000000,   # slope
+                    vy/100000,        # giornaliera dummy con vy/10000 ho un trend, anche con vy/100000
+                    vy/10000,      # settimanale trig 
+                    vy/1000000,     # annuale trig
+                    vy/10          # epsilon
+                    )
+                  ),
+              updt,
+              update_args =  list(nh_annual = nh_annual, nh_week = nh_week),  control = list(maxit = 500)
+              )
+
+fit1$optim.out$convergence
+
+
+# Filtro di Kalman per valutare le previsioni. 
+kfs1 <- KFS(fit1$model, 
+            smoothing = c("state", "signal", "disturbance"))
+
+
+# train_prediction = kfs1$a[1:length(train)]*CONSTANT # come l'ARIMA, i valori fitted so o le previsioni one-ahead
+# train_prediction %>% length()
+# mae_train = mean(abs(train - train_prediction))
+
+val_prediction = kfs1$muhat[(length(train)+1):length(y)]*CONSTANT
+val_prediction %>% length()
+mae_val = mean(abs(val - val_prediction))
+
+k = 24*30
+tot_sum = kfs1$alphahat[1:k,mod$Z == 1] %>% rowSums() %>% as.numeric()
+
+plot(tot_sum, type='l', col = 'brown', ylim = c(min(tot_sum)-30, max(tot_sum)+100))
+
+lines(kfs1$alphahat[1:k,'level'] + kfs1$alphahat[1:k, 3], type='l', col = 'red')
+
+lines(kfs1$alphahat[1:k,'level'], type='l', col = 'green')
+
+lines(kfs1$alphahat[1:k,'level'] + kfs1$alphahat[1:k,3] + kfs1$alphahat[1:k, seq(2 + 23, 2 + 23 + 2*nh_week)] %>% rowSums(), type='l', col = 'blue')
+legend("topleft", legend=c('LLT + Dummy[24] + Trig[24*7] + Trig[24*365]', 
+                           "LLT + Dummy[24]", 
+                           "LLT", 
+                           'LLT + Dummy[24] + Trig[24*7]'),
+       col=c("brown", "red", "green", "blue"), lty = rep(1,3))
+
+
+
+# si osserva questo trend crescente: le varianze del trend sono troppo elevate.
+plot(as.numeric(val), type = 'l', col = 'black', ylim=c(min(val_prediction), max(val_prediction)))
+lines(val_prediction, col = "red")
+
+
+CODE = "Mod_12_plus_regressor"
+result_UCM = rbind(result_UCM, c(CODE, mae_val))
+write.csv(result_UCM, 'result_UCM.csv')
+
+result_UCM %>% arrange(as.numeric(MAE))
+```
+
+
+
+```{r}
+
+y_final = c(as.numeric(train) / CONSTANT, as.numeric(val) / CONSTANT, rep(NA, 24*(30+31)))
+y_final %>% length()
+vy = var(y_final, na.rm = TRUE)
+md = mean(y_final, na.rm = TRUE)
+
+# final model. 
+
+rm(fit1, kfs1, mod)
+
+nh_annual = 16
+nh_week = 8
+
+mod = SSModel(as.numeric(y_final) ~ (SSMtrend(2, list(NA, NA)) + 
+                SSMseasonal(24, NA, "dummy") + 
+                SSMseasonal(24*7, NA, "trig", harmonics = 1:nh_week) +
+                SSMseasonal(24*365, NA, "trig", harmonics = 1:nh_annual)),
+              H = NA)
+# condizioni iniziali non diffuse.
+mod$P1inf[] = 0
+diag(mod$P1) = vy
+mod$a1[1] = md
+
+updt = function(pars, model, nh_annual, nh_week) {
+  
+  model$Q[1, 1, 1] = exp(pars[1])
+  
+  model$Q[2, 2, 1] = exp(pars[2])
+  
+  model$Q[3, 3, 1] = exp(pars[3])
+  
+  diag(model$Q[4:(4 + 2*nh_week-1), 4:(4 + 2*nh_week-1), 1]) = exp(pars[4])
+  
+  diag(model$Q[(4 + 2*nh_week):(4 + 2*nh_week + 2*nh_annual-1),
+               (4 + 2*nh_week):(4 + 2*nh_week + 2*nh_annual-1), 1]) = exp(pars[5])
+  
+  model$H[1, 1, 1] = exp(pars[6])
+  
+  model
+}
+
+# con meno iterazioni ottengo un trend. 
+
+fit1 = fitSSM(mod, 
+              log(c(vy/10000000000,   # level
+                    vy/10000000000,   # slope
+                    vy/100000,        # giornaliera dummy con vy/10000 ho un trend, anche con vy/100000
+                    vy/10000,      # settimanale trig 
+                    vy/1000000,     # annuale trig
+                    vy/10          # epsilon
+                    )
+                  ),
+              updt,
+              update_args =  list(nh_annual = nh_annual, nh_week = nh_week),  control = list(maxit = 500)
+              )
+
+fit1$optim.out$convergence
+
+
+# Filtro di Kalman per valutare le previsioni. 
+kfs1 <- KFS(fit1$model, 
+            smoothing = c("state", "signal", "disturbance"))
+
+
+# si osserva questo trend crescente: le varianze del trend sono troppo elevate.
+prediction = kfs1$muhat[(length(train) + length(val) +1):length(y_final)]*CONSTANT
+plot(prediction, col = "red", type = 'l')
+
+prediction %>% length()
+write.csv(prediction, 'UCM_prediction.csv')
+s
+CODE = "Mod_Final"
+result_UCM = rbind(result_UCM, c(CODE, mae_val))
+write.csv(result_UCM, 'result_UCM.csv')
+
+
+
+
+```
+
+
+## ALL TOGETHER
+
+```{r}
+
+ARIMA_prediction = read.csv('../R_ARIMA_UCM_Prophet/SDMTSA_852646_1.csv', sep = ';')
+UCM = read.csv('../R_ARIMA_UCM_Prophet/UCM_prediction.csv')
+UCM = UCM %>% `colnames<-`(c('Index', 'UCM'))
+UCM = UCM[,c('UCM')]
+UCM = as.integer(UCM)
+ML = read.csv('../Python_Machine_Learning/neural_network_prediction.csv')
+ML = ML[,c('ML')]
+ML = as.integer(ML)
+
+FINAL = cbind(ARIMA_prediction, UCM, ML)
+
+PATH = "C:/Users/Lucia/Documents/Magistrale/Second Year/Time Series/Progetto/SDMTSA_852646_1.csv"
+write.table(FINAL, file = PATH, quote = FALSE, row.names = FALSE, sep = ";")
+
+Date = seq(as.POSIXct("2020-09-01 01:00:00"), as.POSIXct("2020-11-01 00:00:00"), by="hour")
+colors <- c("ARIMA" = "blue", "UCM" = "red", "ML" = "black")
+
+ggplot(cbind(FINAL, Date), aes(x = Date)) +
+    geom_line(aes(y = UCM, color = "UCM")) +
+    geom_line(aes(y = ML, color = "ML")) +
+    geom_line(aes(y = ARIMA, color = "ARIMA")) +  
+    labs(x = "Year",
+         y = "Value",
+         color = "Legend") +
+    scale_color_manual(values = colors)
+
+```
+
+
+
+```{r}
+read.csv('../SDMTSA_852646_1.csv', sep = ';')
+```
+
+
